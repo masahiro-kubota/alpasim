@@ -11,7 +11,7 @@
 #SBATCH --job-name alpasim
 #SBATCH --output=./runs/slurm_output/%j.log
 
-# Submit via: sbatch -A <allocation> [--array=0-<n>] submit.sh [<hydra_overrides>]
+# Submit via: sbatch -A <allocation> [--array=0-<n>] submit.sh [--oss] [<hydra_overrides>]
 #
 # Where <allocation> is your project allocation and <n> is the number of jobs to
 # run. The scenarios will automatically be distributed across the jobs.
@@ -34,6 +34,31 @@ fi
 if [[ -z "$DESCRIPTION" ]]; then
     DESCRIPTION="unspecified"
 fi
+
+# Parse script args
+DEPLOY_TARGET="ord"
+HYDRA_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --oss)
+            DEPLOY_TARGET="ord_oss"
+            shift
+            ;;
+        --)
+            shift
+            while [[ $# -gt 0 ]]; do
+                HYDRA_ARGS+=("$1")
+                shift
+            done
+            break
+            ;;
+        *)
+            HYDRA_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
 
 # Find parent directory, no matter where to script is called from
 
@@ -99,10 +124,10 @@ fi
 # Install new dependencies if required.
 uv tool upgrade alpasim_wizard
 alpasim_wizard \
-    +deploy=ord \
+    +deploy=${DEPLOY_TARGET} \
     wizard.log_dir=$LOGDIR \
     wizard.array_job_dir=$ARRAY_JOB_DIR \
     wizard.latest_symlink=true \
     wizard.submitter="$SUBMITTER" \
     wizard.description="$DESCRIPTION" \
-    "$@" # pass hydra overrides
+    "${HYDRA_ARGS[@]}" # pass hydra overrides

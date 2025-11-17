@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 NVIDIA Corporation
+
 """VAM Driver implementation for Alpasim."""
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ import omegaconf.listconfig
 import torch
 import torch.serialization
 from alpasim_grpc import API_VERSION_MESSAGE
+from alpasim_grpc.v0 import sensorsim_pb2
 from alpasim_grpc.v0.common_pb2 import (
     Empty,
     Pose,
@@ -50,7 +54,7 @@ from alpasim_grpc.v0.egodriver_pb2_grpc import (
     EgodriverServiceServicer,
     add_EgodriverServiceServicer_to_server,
 )
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf
 from PIL import Image
 from vam.action_expert import VideoActionModelInference
 from vam.datalib.transforms import NeuroNCAPTransform
@@ -59,6 +63,8 @@ import grpc
 import grpc.aio
 
 from .frame_cache import FrameCache, FrameEntry
+from .rectification import FthetaToPinholeRectifier, build_rectifier_map
+from .schema import VAMDriverConfig
 
 logger = logging.getLogger(__name__)
 
@@ -183,13 +189,16 @@ class Session:
     frame_cache: FrameCache
     available_cameras_logical_ids: set[str]
     desired_cameras_logical_ids: set[str]
+    rectifiers: dict[str, Optional[FthetaToPinholeRectifier]] = field(
+        default_factory=dict
+    )
     poses: list[PoseAtTime] = field(default_factory=list)
     current_command: DriveCommand = DriveCommand.STRAIGHT  # Default to straight
 
     @staticmethod
     def create(
         request: DriveSessionRequest,
-        cfg: DictConfig,
+        cfg: VAMDriverConfig,
         context_length: int,
     ) -> Session:
         """Create a new VAM session."""
@@ -204,18 +213,28 @@ class Session:
         if vehicle is None:
             raise ValueError("Vehicle definition is required in DriveSessionRequest")
 
+        camera_specs: dict[
+            str, sensorsim_pb2.AvailableCamerasReturn.AvailableCamera
+        ] = {}
         for camera_def in vehicle.available_cameras:
             if not camera_def.logical_id:
                 raise ValueError(
                     "Logical ID is required for each camera in VehicleDefinition"
                 )
             available_cameras_logical_ids.add(camera_def.logical_id)
+            camera_specs[camera_def.logical_id] = camera_def
 
         desired_cameras_logical_ids = set(cfg.inference.use_cameras)
         if not desired_cameras_logical_ids:
             raise ValueError("No cameras specified in inference configuration")
         if not len(desired_cameras_logical_ids) == 1:
             raise ValueError("Only one camera is supported for now.")
+
+        rectifiers = build_rectifier_map(
+            cfg.rectification,
+            desired_cameras_logical_ids,
+            camera_specs,
+        )
 
         session = Session(
             uuid=request.session_uuid,
@@ -224,6 +243,7 @@ class Session:
             frame_cache=FrameCache(context_length),
             available_cameras_logical_ids=available_cameras_logical_ids,
             desired_cameras_logical_ids=desired_cameras_logical_ids,
+            rectifiers=rectifiers,
         )
 
         return session
@@ -231,6 +251,15 @@ class Session:
     def add_image(self, image_tensor: np.ndarray, timestamp_us: int) -> None:
         """Add an image observation."""
         self.frame_cache.add_image(timestamp_us, image_tensor)
+
+    def rectify_image(self, logical_id: str, image: Image.Image) -> Image.Image:
+        """Apply rectification for logical_id if configured."""
+        rectifier = self.rectifiers.get(logical_id)
+        if rectifier is None:
+            return image
+        image_np = np.array(image)
+        rectified = rectifier.rectify(image_np)
+        return Image.fromarray(rectified)
 
     def add_egoposes(self, egoposes: Trajectory) -> None:
         """Add rig-est pose observations in the local frame."""
@@ -316,7 +345,7 @@ class VAMPolicyService(EgodriverServiceServicer):
 
     def __init__(
         self,
-        cfg: DictConfig,
+        cfg: VAMDriverConfig,
         loop: asyncio.AbstractEventLoop,
         grpc_server: grpc.aio.Server,
         device: torch.device,
@@ -724,10 +753,9 @@ class VAMPolicyService(EgodriverServiceServicer):
         if grpc_image.logical_id not in session.desired_cameras_logical_ids:
             raise ValueError(f"Camera {grpc_image.logical_id} not in desired cameras")
 
+        image = session.rectify_image(grpc_image.logical_id, image)
         image = self._resize_and_crop_image(image)
-        image_np = np.array(image)
-
-        session.add_image(image_np, grpc_image.frame_end_us)
+        session.add_image(np.array(image), grpc_image.frame_end_us)
 
         return Empty()
 
@@ -919,7 +947,7 @@ class VAMPolicyService(EgodriverServiceServicer):
         await self.stop_worker()
 
 
-async def serve(cfg: DictConfig) -> None:
+async def serve(cfg: VAMDriverConfig) -> None:
     server = grpc.aio.server()
     loop = asyncio.get_running_loop()
 
@@ -952,7 +980,7 @@ async def serve(cfg: DictConfig) -> None:
     config_path="../../configs",
     config_name="vam_driver",
 )
-def main(cfg: DictConfig) -> None:
+def main(cfg: VAMDriverConfig) -> None:
     logging.basicConfig(
         level=logging.DEBUG,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",

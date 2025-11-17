@@ -3,8 +3,8 @@
 # Use using the cmd line arg "+deploy=ord" when calling the wizard or sbatch submit.sh
 
 defaults:
-  - _self_
   - /stable_manifest/internal
+  - _self_
 
 defines:
   filesystem: "/lustre/fs12/portfolios/av/projects/av_alpamayo_sim/.cache"

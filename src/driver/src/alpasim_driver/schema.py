@@ -50,6 +50,18 @@ class TrajectoryConfig:
 
 
 @dataclass
+class RectificationTargetConfig:
+    """Target pinhole parameters for rectifying a rendered camera."""
+
+    focal_length: tuple[float, float]
+    principal_point: tuple[float, float]
+    resolution_hw: tuple[int, int]
+    radial: tuple[float, ...] = ()
+    tangential: tuple[float, ...] = ()
+    thin_prism: tuple[float, ...] = ()
+
+
+@dataclass
 class VAMDriverConfig:
     """Main VAM driver configuration."""
 
@@ -74,3 +86,6 @@ class VAMDriverConfig:
 
     # If true, generates debug images in `output_dir`
     plot_debug_images: bool = False
+
+    # Optional per-camera rectification definitions
+    rectification: Optional[dict[str, RectificationTargetConfig]] = None
