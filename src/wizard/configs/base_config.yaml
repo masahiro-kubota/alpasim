@@ -306,7 +306,7 @@ runtime:
       cov_orientation_z: 0.0007
       time_constant_orientation: 5.0
 
-    route_generator_type: "RECORDED" # "MAP" or "RECORDED"
+    route_generator_type: "MAP" # "MAP" or "RECORDED"
 
     vehicle: null # use values from the .usdz file (original dimensions)
 
