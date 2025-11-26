@@ -100,6 +100,13 @@ async def test_vam_policy_drive_flow(tmp_path: Path) -> None:
     desired_camera_name = cfg.inference.use_cameras[0]
     camera_def = rollout_spec.vehicle.available_cameras.add()
     camera_def.logical_id = desired_camera_name
+    camera_def.intrinsics.resolution_h = cfg.inference.image_height
+    camera_def.intrinsics.resolution_w = cfg.inference.image_width
+    ftheta = camera_def.intrinsics.ftheta_param
+    ftheta.principal_point_x = cfg.inference.image_width / 2.0
+    ftheta.principal_point_y = cfg.inference.image_height / 2.0
+    ftheta.angle_to_pixeldist_poly.extend([0.0, 1.0])
+    ftheta.pixeldist_to_angle_poly.extend([0.0, 1.0])
     start_request = DriveSessionRequest(
         session_uuid=session_uuid,
         random_seed=0,
@@ -110,15 +117,19 @@ async def test_vam_policy_drive_flow(tmp_path: Path) -> None:
         await service.start_session(start_request, None)
         session = service._sessions[session_uuid]
 
-        assert isinstance(session.frame_cache, FrameCache)
+        # Check multi-camera frame caches
+        assert isinstance(session.frame_caches, dict)
+        assert desired_camera_name in session.frame_caches
+        assert isinstance(session.frame_caches[desired_camera_name], FrameCache)
         context = service._context_length
         assert context > 0
 
         base_ts = 1_000_000
         dt = 100_000
 
-        traj_msg = TrajectoryMsg()
+        # Submit egomotion observations one pose at a time (driver expects single pose per call)
         for i in range(context + 1):
+            traj_msg = TrajectoryMsg()
             pose_at_time = PoseAtTime(
                 pose=Pose(
                     vec=Vec3(x=float(i), y=0.0, z=0.0),
@@ -128,11 +139,11 @@ async def test_vam_policy_drive_flow(tmp_path: Path) -> None:
             )
             traj_msg.poses.append(pose_at_time)
 
-        egomotion_request = RolloutEgoTrajectory(
-            session_uuid=session_uuid,
-            trajectory=traj_msg,
-        )
-        await service.submit_egomotion_observation(egomotion_request, None)
+            egomotion_request = RolloutEgoTrajectory(
+                session_uuid=session_uuid,
+                trajectory=traj_msg,
+            )
+            await service.submit_egomotion_observation(egomotion_request, None)
 
         height = cfg.inference.image_height
         width = cfg.inference.image_width
@@ -176,11 +187,11 @@ async def test_vam_policy_drive_flow(tmp_path: Path) -> None:
 
         assert len(response.trajectory.poses) > 1
         latest_pose = response.trajectory.poses[0]
-        assert latest_pose.timestamp_us == traj_msg.poses[-1].timestamp_us
-        assert (
-            pytest.approx(latest_pose.pose.vec.x, rel=1e-5)
-            == traj_msg.poses[-1].pose.vec.x
-        )
+        # Last submitted pose was at index=context with timestamp base_ts + context * dt
+        expected_last_ts = base_ts + context * dt
+        expected_last_x = float(context)
+        assert latest_pose.timestamp_us == expected_last_ts
+        assert pytest.approx(latest_pose.pose.vec.x, rel=1e-5) == expected_last_x
     finally:
         await service.stop_worker()
         if session_uuid in service._sessions:

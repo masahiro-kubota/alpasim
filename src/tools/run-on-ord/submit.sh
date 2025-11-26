@@ -107,12 +107,23 @@ cat ./runs/slurm_output/${SLURM_JOB_ID}.log > ${LOGDIR}/txt-logs/slurm.log 2>/de
 exec > >(tee -a "${LOGDIR}/txt-logs/slurm.log") 2>&1
 
 # Create resume.sh script
+# We build a resume command that can be executed from any directory by using absolute paths.
+#
+# Step 1: Get the original sbatch command used to submit this job.
+#   Example output: "sbatch -A av_alpamayo_sim /path/to/run-on-ord/submit.sh --oss"
 ORIG_SUBMIT_CMD=$(sacct -j ${SLURM_JOB_ID} -o submitline -P | head -n 2 | sed '1d')
-STRIPPED_ORIG_SUBMIT_CMD=$(echo "${ORIG_SUBMIT_CMD}" | sed 's/submit\.sh.*//')
-# Ensure no stray space is introduced between the run-on-ord path and the resume script name.
-# STRIPPED_ORIG_SUBMIT_CMD already ends with "/run-on-ord/" so we can safely append the script name
-# directly without an extra space.
-RESUME_CMD="${STRIPPED_ORIG_SUBMIT_CMD}resume_slurm_job.sh ${ARRAY_JOB_DIR}"
+#
+# Step 2: Extract just the sbatch options (account, partition, etc.) by:
+#   - First sed: Remove everything from "submit.sh" onwards
+#     "sbatch -A av_alpamayo_sim /path/to/run-on-ord/submit.sh --oss" -> "sbatch -A av_alpamayo_sim /path/to/run-on-ord/"
+#   - Second sed: Remove any path prefix up to and including "run-on-ord/"
+#     "sbatch -A av_alpamayo_sim /path/to/run-on-ord/" -> "sbatch -A av_alpamayo_sim "
+SBATCH_OPTIONS=$(echo "${ORIG_SUBMIT_CMD}" | sed 's/submit\.sh.*//' | sed 's|.*/run-on-ord/||')
+#
+# Step 3: Build the resume command using the absolute path to resume_slurm_job.sh via SCRIPT_DIR.
+# This ensures resume.sh can be executed from any directory.
+#   Example result: "sbatch -A av_alpamayo_sim /path/to/run-on-ord/resume_slurm_job.sh /path/to/job"
+RESUME_CMD="${SBATCH_OPTIONS}${SCRIPT_DIR}/resume_slurm_job.sh ${ARRAY_JOB_DIR}"
 
 # Copy resume template to LOGDIR and append the actual resume command if it doesn't exist yet
 if [ ! -f "${ARRAY_JOB_DIR}/resume.sh" ] && [[ -z "${SLURM_ARRAY_TASK_ID}" || "${SLURM_ARRAY_TASK_ID}" == "${SLURM_ARRAY_TASK_MIN}" ]]; then

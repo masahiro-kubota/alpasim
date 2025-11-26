@@ -53,6 +53,10 @@ class VideoRendererConfig:
     render_video: bool = MISSING
     # Which camera to render (logical id)
     camera_id_to_render: str = MISSING
+    # Whether to overlay planner trajectories onto the camera view
+    overlay_plans_on_camera: bool = True
+    # Order and inclusion of metrics in the rendered table; None shows all metrics.
+    metrics_table_entries: list[str] | None = None
     # Options for how to render the BEV map
     map_video: MapVideoConfig = MISSING
     # Only render every nth frame

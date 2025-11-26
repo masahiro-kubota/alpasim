@@ -25,7 +25,8 @@ from alpasim_grpc.v0.sensorsim_pb2 import (
 from alpasim_grpc.v0.sensorsim_pb2_grpc import SensorsimServiceStub
 from alpasim_runtime.camera_catalog import CameraCatalog
 from alpasim_runtime.logs import LogEntry
-from alpasim_runtime.services.service_base import ServiceBase, timed_method
+from alpasim_runtime.services.service_base import ServiceBase
+from alpasim_runtime.telemetry.rpc_wrapper import profiled_rpc_call
 from alpasim_runtime.types import Clock, ImageWithMetadata, RuntimeCamera
 from alpasim_utils.qvec import QVec
 from alpasim_utils.trajectory import Trajectory
@@ -75,7 +76,6 @@ class SensorsimService(ServiceBase[SensorsimServiceStub]):
             copied.append(camera_copy)
         return copied
 
-    @timed_method("get_available_cameras")
     async def get_available_cameras(
         self, scene_id: str
     ) -> list[AvailableCamerasReturn.AvailableCamera]:
@@ -95,8 +95,11 @@ class SensorsimService(ServiceBase[SensorsimServiceStub]):
                 )
 
                 logger.info(f"Requesting available cameras for {scene_id=}")
-                response: AvailableCamerasReturn = (
-                    await self.stub.get_available_cameras(request)
+                response: AvailableCamerasReturn = await profiled_rpc_call(
+                    "get_available_cameras",
+                    "sensorsim",
+                    self.stub.get_available_cameras,
+                    request,
                 )
 
                 await self.session_info.log_writer.log_message(
@@ -107,7 +110,6 @@ class SensorsimService(ServiceBase[SensorsimServiceStub]):
 
         return self._copy_available_cameras(self._available_cameras[scene_id])
 
-    @timed_method("get_available_ego_masks")
     async def get_available_ego_masks(self) -> AvailableEgoMasksReturn:
         """
         Get available ego masks.
@@ -117,12 +119,25 @@ class SensorsimService(ServiceBase[SensorsimServiceStub]):
         if self.skip:
             return AvailableEgoMasksReturn()
 
+        # Fast path: return cached value without acquiring lock
+        if self._available_ego_masks is not None:
+            return self._available_ego_masks
+
         async with self._available_ego_masks_lock:
+            # Double-check after acquiring lock
             if self._available_ego_masks is not None:
                 return self._available_ego_masks
 
-            self._available_ego_masks = await self.stub.get_available_ego_masks(Empty())
-            logger.info(f"Available ego masks: {self._available_ego_masks}")
+            self._available_ego_masks = await profiled_rpc_call(
+                "get_available_ego_masks",
+                "sensorsim",
+                self.stub.get_available_ego_masks,
+                Empty(),
+            )
+            logger.info(
+                f"Available ego masks: {self._available_ego_masks} "
+                f"(session={self.session_info.uuid}, service_addr={self.address})"
+            )
 
         return self._available_ego_masks
 
@@ -257,7 +272,9 @@ class SensorsimService(ServiceBase[SensorsimServiceStub]):
             LogEntry(aggregated_render_request=request)
         )
 
-        response: AggregatedRenderReturn = await self.stub.render_aggregated(request)
+        response: AggregatedRenderReturn = await profiled_rpc_call(
+            "render_aggregated", "sensorsim", self.stub.render_aggregated, request
+        )
 
         images_with_metadata = []
         for rgb_response in response.rgb_responses:
@@ -272,7 +289,6 @@ class SensorsimService(ServiceBase[SensorsimServiceStub]):
 
         return (images_with_metadata, response.driver_data)
 
-    @timed_method("render_rgb")
     async def render(
         self,
         ego_trajectory: Trajectory,
@@ -315,7 +331,9 @@ class SensorsimService(ServiceBase[SensorsimServiceStub]):
 
         await self.session_info.log_writer.log_message(LogEntry(render_request=request))
 
-        response: RGBRenderReturn = await self.stub.render_rgb(request)
+        response: RGBRenderReturn = await profiled_rpc_call(
+            "render_rgb", "sensorsim", self.stub.render_rgb, request
+        )
 
         return ImageWithMetadata(
             start_timestamp_us=trigger.time_range_us.start,

@@ -15,7 +15,7 @@ import polars as pl
 from tqdm import tqdm
 
 from eval.aggregation.processing import ProcessedMetricDFs
-from eval.data import EvaluationResultContainer, SimulationResult
+from eval.data import CameraProjector, EvaluationResultContainer, SimulationResult
 from eval.schema import EvalConfig, MapElements
 from eval.video_data import ShapelyMap
 
@@ -147,6 +147,7 @@ def render_table(
     processed_metric_dfs: ProcessedMetricDFs,
     evaluation_result_container: EvaluationResultContainer,
     time: int,
+    metrics_table_entries: list[str] | None = None,
 ) -> mpl.table.Table:
     clipgt_id, batch_id, rollout_id = (
         evaluation_result_container.get_clipgt_batch_and_rollout_id()
@@ -167,6 +168,24 @@ def render_table(
         .unpivot()
         .sort("variable")
     )
+
+    available_metric_names = df_long_avg_t["variable"].to_list()
+    metric_names = (
+        available_metric_names
+        if metrics_table_entries is None
+        else [
+            metric_name
+            for metric_name in metrics_table_entries
+            if metric_name in available_metric_names
+        ]
+    )
+    avg_value_by_metric = {
+        row["variable"]: row["value"] for row in df_long_avg_t.iter_rows(named=True)
+    }
+    agg_function_by_metric = {
+        row["name"]: row["time_aggregation"]
+        for row in processed_metric_dfs.agg_function_df.iter_rows(named=True)
+    }
 
     filtered_df_long = processed_metric_dfs.unprocessed_df.filter(
         pl.col("timestamps_us") == time,
@@ -191,20 +210,20 @@ def render_table(
     col_names = ["Agg", "Per-Ts"]
     row_name = []
 
-    for row in df_long_avg_t.iter_rows(named=True):
-        row_name.append(row["variable"])
+    for metric_name in metric_names:
+        row_name.append(metric_name)
         curr_df = filtered_df_long.filter(
-            pl.col("name") == row["variable"],
+            pl.col("name") == metric_name,
         )
         assert len(curr_df) <= 1
         # We might not have per-ts values for all ts.
         value_str = "N/A" if len(curr_df) == 0 else f"{curr_df['values'][0]:.2f}"
         # We also might not have a value for any ts.
-        agg_value_str = "N/A" if row["value"] is None else f"{row['value']:.2f}"
-        agg_str = processed_metric_dfs.agg_function_df.filter(
-            pl.col("name") == row["variable"],
-        )["time_aggregation"][0]
-        table_data.append([f"{agg_value_str} ({agg_str})", value_str])
+        agg_value = avg_value_by_metric.get(metric_name)
+        agg_value_str = "N/A" if agg_value is None else f"{agg_value:.2f}"
+        agg_str = agg_function_by_metric.get(metric_name)
+        agg_str_display = agg_str if agg_str is not None else "N/A"
+        table_data.append([f"{agg_value_str} ({agg_str_display})", value_str])
 
     table = ax.table(
         cellText=table_data,
@@ -248,10 +267,12 @@ def render_table(
         top_cell = table.get_celld()[(0, col)]
         top_cell.visible_edges = top_cell.visible_edges.replace("T", "")
 
-    for col in range(len(col_names) + 1):
-        # Bottom row cells - remove bottom edge
-        bottom_cell = table.get_celld()[(len(row_name), col - 1)]
-        bottom_cell.visible_edges = bottom_cell.visible_edges.replace("B", "")
+    if row_name:
+        for col in range(len(col_names) + 1):
+            # Bottom row cells - remove bottom edge
+            bottom_cell = table.get_celld().get((len(row_name), col - 1))
+            if bottom_cell is not None:
+                bottom_cell.visible_edges = bottom_cell.visible_edges.replace("B", "")
 
     return table
 
@@ -299,7 +320,55 @@ def create_video_animation_for_eval_container(
 
     fig, axs = _setup_fig()
 
+    first_image = camera.image_at_time(timestamps_us[0])
+    img_w = first_image.size[0] if first_image else None
+    img_h = first_image.size[1] if first_image else None
     camera.render_image_at_time(timestamps_us[0], axs["image"])
+    if img_w is not None and img_h is not None:
+        axs["image"].set_xlim(0, img_w)
+        axs["image"].set_ylim(img_h, 0)
+        axs["image"].set_autoscale_on(False)
+
+    overlay_enabled = cfg.video.overlay_plans_on_camera
+    camera_projector: CameraProjector | None = None
+    if overlay_enabled:
+        if not sim_result.driver_responses.per_timestep_driver_responses:
+            logger.info("No driver responses found; disabling camera overlay.")
+            overlay_enabled = False
+        else:
+            calibration = sim_result.cameras.calibrations_by_logical_id.get(
+                cfg.video.camera_id_to_render
+            )
+            if calibration is None:
+                logger.warning(
+                    "No calibration for camera %s; disabling camera overlay.",
+                    cfg.video.camera_id_to_render,
+                )
+                overlay_enabled = False
+            else:
+                try:
+                    camera_projector = CameraProjector(
+                        calibration=calibration,
+                        actual_resolution=first_image.size if first_image else None,
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        "Unsupported calibration for camera %s (%s); "
+                        "disabling camera overlay.",
+                        cfg.video.camera_id_to_render,
+                        exc,
+                    )
+                    overlay_enabled = False
+
+    if overlay_enabled:
+        overlay_frame_matches = np.intersect1d(
+            timestamps_us, sim_result.driver_responses.timestamps_us
+        )
+        if len(overlay_frame_matches) == 0:
+            logger.info(
+                "Driver response timestamps do not align with rendered frames; "
+                "camera overlay will be empty."
+            )
 
     if should_render_table:
         table = render_table(
@@ -307,6 +376,7 @@ def create_video_animation_for_eval_container(
             processed_metrics_dfs,
             evaluation_result_container,
             timestamps_us[0],
+            cfg.video.metrics_table_entries,
         )
 
     text_artist = axs["table"].text(
@@ -317,6 +387,29 @@ def create_video_animation_for_eval_container(
         va="bottom",
         transform=axs["table"].transAxes,
         fontsize=6,
+    )
+
+    # Get initial command name from driver response
+    initial_driver_response = sim_result.driver_responses.get_driver_response_for_time(
+        timestamps_us[0], which_time="now"
+    )
+    initial_command = (
+        initial_driver_response.command_name
+        if initial_driver_response and initial_driver_response.command_name
+        else None
+    )
+    command_text_artist = axs["image"].text(
+        0.02,
+        0.98,
+        f"Command: {initial_command}" if initial_command else "",
+        ha="left",
+        va="top",
+        transform=axs["image"].transAxes,
+        fontsize=10,
+        color="white",
+        fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.7),
+        visible=initial_command is not None,
     )
 
     ego_transform = get_ego_transform(
@@ -479,11 +572,52 @@ def create_video_animation_for_eval_container(
 
         text_artist.set_text(f"Time: {time}")
 
+        # Update command text from driver response
+        driver_response = sim_result.driver_responses.get_driver_response_for_time(
+            time, which_time="now"
+        )
+        command_name = (
+            driver_response.command_name
+            if driver_response and driver_response.command_name
+            else None
+        )
+        if command_name:
+            command_text_artist.set_text(f"Command: {command_name}")
+            command_text_artist.set_visible(True)
+        else:
+            command_text_artist.set_visible(False)
+
+        overlay_artists: list[plt.Artist] = []
+        if overlay_enabled and camera_projector is not None:
+            overlay_artists = sim_result.driver_responses.render_on_camera(
+                axs["image"],
+                camera_projector,
+                time,
+                which_time="now",
+            )
+            overlay_artists.extend(
+                sim_result.routes.render_on_camera(
+                    axs["image"],
+                    camera_projector,
+                    time,
+                )
+            )
+
         all_artists = _list_in_dict_in_dict_to_list(artists_on_map)
         all_artists.append(camera_artist)
+        all_artists.extend(overlay_artists)
         if should_render_table:
             all_artists.append(table)
         all_artists.append(text_artist)
+        all_artists.append(command_text_artist)
+        # Keep camera axis locked to image extent
+        if camera_artist is not None:
+            array = camera_artist.get_array()
+            if array is not None:
+                h, w = array.shape[:2]
+                axs["image"].set_xlim(0, w)
+                axs["image"].set_ylim(h, 0)
+                axs["image"].set_autoscale_on(False)
         return all_artists
 
     timestamps_to_render_us = timestamps_us[:: cfg.video.render_every_nth_frame]

@@ -83,23 +83,23 @@ class TestPortAssignment(unittest.TestCase):
             server_socket.close()
 
     def test_max_ports_limit(self) -> None:
-        """Test that max 100 ports are assigned."""
+        """Test that max 1000 ports are assigned."""
         baseport = 33000
         port_iter = create_port_assigner(baseport)
 
-        # Get 100 ports successfully
+        # Get 1000 ports successfully
         ports = []
-        for _ in range(100):
+        for _ in range(1000):
             ports.append(next(port_iter))
 
-        self.assertEqual(len(ports), 100)
-        self.assertEqual(len(set(ports)), 100)  # All unique
+        self.assertEqual(len(ports), 1000)
+        self.assertEqual(len(set(ports)), 1000)  # All unique
 
-        # 101st port should raise AssertionError
+        # 1001st port should raise AssertionError
         with self.assertRaises(AssertionError) as ctx:
             next(port_iter)
 
-        self.assertIn("100 different port numbers", str(ctx.exception))
+        self.assertIn("1000 different port numbers", str(ctx.exception))
 
     def test_multiple_occupied_ports(self) -> None:
         """Test behavior with multiple occupied ports."""

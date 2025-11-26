@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Dict, Iterable
 
@@ -17,6 +18,8 @@ from alpasim_runtime.config import (
     OpenCVPinholeConfig,
 )
 from alpasim_utils.qvec import QVec
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -220,17 +223,128 @@ class CameraCatalog:
     """Central catalogue for sensorsim and locally-defined cameras."""
 
     def __init__(self, config_defs: Iterable[CameraDefinitionConfig] | None):
-        """Initialize the catalog with optional locally configured definitions."""
-        self._local_definitions: Dict[str, CameraDefinition] = {}
+        """Initialize the catalog with optional locally configured overrides.
+
+        Args:
+            config_defs: Partial camera definition configs. Only `logical_id` is
+                required; other fields (rig_to_camera, intrinsics, resolution_hw,
+                shutter_type) are optional and will override sensorsim values
+                when provided.
+        """
+        self._local_overrides: Dict[str, CameraDefinitionConfig] = {}
         for cfg in config_defs or []:
-            if cfg.logical_id in self._local_definitions:
+            if cfg.logical_id in self._local_overrides:
                 raise ValueError(
                     f"Duplicate local camera definition for {cfg.logical_id}"
                 )
-            self._local_definitions[cfg.logical_id] = CameraDefinition.from_config(cfg)
+            self._local_overrides[cfg.logical_id] = cfg
 
         self._scene_definitions: Dict[str, Dict[str, CameraDefinition]] = {}
         self._scene_locks: Dict[str, asyncio.Lock] = {}
+
+    def _apply_override(
+        self,
+        base: CameraDefinition,
+        override: CameraDefinitionConfig,
+    ) -> CameraDefinition:
+        """Apply partial config override to a base camera definition.
+
+        Each field in the override is applied only if it is not None.
+        This enables partial overrides (e.g. only rig_to_camera).
+        """
+        logical_id = base.logical_id
+
+        # Start with copies of the base values
+        intrinsics = sensorsim_pb2.CameraSpec()
+        intrinsics.CopyFrom(base.intrinsics)
+        rig_to_camera = base.rig_to_camera.clone()
+
+        # Apply rig_to_camera override if provided
+        if override.rig_to_camera is not None:
+            old_translation = tuple(base.rig_to_camera.vec3)
+            old_rotation = tuple(base.rig_to_camera.quat)
+            new_translation = override.rig_to_camera.translation_m
+            new_rotation = override.rig_to_camera.rotation_xyzw
+            logger.info(
+                "[%s] Overriding rig_to_camera: "
+                "translation_m %s -> %s, rotation_xyzw %s -> %s",
+                logical_id,
+                old_translation,
+                new_translation,
+                old_rotation,
+                new_rotation,
+            )
+            rig_to_camera = CameraDefinition._pose_from_config(
+                new_translation,
+                new_rotation,
+            )
+
+        # Apply resolution override if provided
+        if override.resolution_hw is not None:
+            old_resolution = (intrinsics.resolution_h, intrinsics.resolution_w)
+            new_resolution = override.resolution_hw
+            logger.info(
+                "[%s] Overriding resolution_hw: %s -> %s",
+                logical_id,
+                old_resolution,
+                new_resolution,
+            )
+            intrinsics.resolution_h = new_resolution[0]
+            intrinsics.resolution_w = new_resolution[1]
+
+        # Apply shutter_type override if provided
+        if override.shutter_type is not None:
+            old_shutter = sensorsim_pb2.ShutterType.Name(intrinsics.shutter_type)
+            new_shutter = override.shutter_type
+            logger.info(
+                "[%s] Overriding shutter_type: %s -> %s",
+                logical_id,
+                old_shutter,
+                new_shutter,
+            )
+            try:
+                intrinsics.shutter_type = sensorsim_pb2.ShutterType.Value(new_shutter)
+            except ValueError as exc:
+                valid_values = ", ".join(sensorsim_pb2.ShutterType.keys())
+                raise ValueError(
+                    f"Unsupported shutter_type '{new_shutter}'."
+                    f" Expected one of: {valid_values}."
+                ) from exc
+
+        # Apply intrinsics override if provided (replaces all intrinsic params)
+        if override.intrinsics is not None:
+            logger.info(
+                "[%s] Overriding intrinsics with model=%s",
+                logical_id,
+                override.intrinsics.model,
+            )
+            # Clear existing intrinsics params and apply new ones
+            intrinsics.ClearField("opencv_pinhole_param")
+            intrinsics.ClearField("opencv_fisheye_param")
+            intrinsics.ClearField("ftheta_param")
+
+            if override.intrinsics.model == "opencv_pinhole":
+                CameraDefinition._apply_pinhole_intrinsics(
+                    intrinsics, override.intrinsics.opencv_pinhole
+                )
+            elif override.intrinsics.model == "opencv_fisheye":
+                CameraDefinition._apply_fisheye_intrinsics(
+                    intrinsics, override.intrinsics.opencv_fisheye
+                )
+            elif override.intrinsics.model == "ftheta":
+                CameraDefinition._apply_ftheta_intrinsics(
+                    intrinsics, override.intrinsics.ftheta
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported intrinsics model {override.intrinsics.model}"
+                )
+
+        return CameraDefinition(
+            logical_id=base.logical_id,
+            intrinsics=intrinsics,
+            rig_to_camera=rig_to_camera,
+        )
 
     async def merge_local_and_sensorsim_cameras(
         self,
@@ -251,10 +365,9 @@ class CameraCatalog:
                     key = camera.logical_id
                     scene_defs[key] = CameraDefinition.from_proto(camera)
 
-                # Check that all local cameras are also available in sensorsim
-                # because sensorsim only supports _changing_, not adding
-                # cameras.
-                missing_cameras = set(self._local_definitions.keys()) - set(
+                # Check that all local overrides reference cameras available
+                # in sensorsim (sensorsim only supports changing, not adding).
+                missing_cameras = set(self._local_overrides.keys()) - set(
                     scene_defs.keys()
                 )
                 if missing_cameras:
@@ -262,12 +375,20 @@ class CameraCatalog:
                         f"Local camera definitions {missing_cameras} are not "
                         f"available in sensorsim for scene '{scene_id}'."
                     )
-                # Overwrite with local definitions
-                merged: Dict[str, CameraDefinition] = {
-                    **scene_defs,
-                    **self._local_definitions,
-                }
-                self._scene_definitions[scene_id] = merged
+
+                # Apply local overrides field-by-field
+                if self._local_overrides:
+                    logger.info(
+                        "Applying %d camera override(s) for scene '%s': %s",
+                        len(self._local_overrides),
+                        scene_id,
+                        list(self._local_overrides.keys()),
+                    )
+                for logical_id, override in self._local_overrides.items():
+                    base = scene_defs[logical_id]
+                    scene_defs[logical_id] = self._apply_override(base, override)
+
+                self._scene_definitions[scene_id] = scene_defs
 
     def get_camera_definitions(self, scene_id: str) -> Dict[str, CameraDefinition]:
         """Return copy of the cached camera definitions for `scene_id`."""

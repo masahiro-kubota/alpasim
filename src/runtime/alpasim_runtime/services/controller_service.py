@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, List, Type
 
 import numpy as np
-from alpasim_grpc.v0.common_pb2 import Vec3
+from alpasim_grpc.v0.common_pb2 import DynamicState, Vec3
 from alpasim_grpc.v0.controller_pb2 import (
     RunControllerAndVehicleModelRequest,
     RunControllerAndVehicleModelResponse,
@@ -23,8 +23,8 @@ from alpasim_runtime.services.service_base import (
     WILDCARD_SCENE_ID,
     ServiceBase,
     SessionInfo,
-    timed_method,
 )
+from alpasim_runtime.telemetry.rpc_wrapper import profiled_rpc_call
 from alpasim_utils.qvec import QVec
 from alpasim_utils.trajectory import Trajectory
 
@@ -34,14 +34,16 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PropagatedPoses:
     """
-    A pair of poses, one representing the true predicted pose output from the vehicle model, and the
-    other representing the estimate used by the controller in the loop
+    A pair of poses and dynamic states, one representing the true predicted output from
+    the vehicle model, and the other representing the estimate used by the controller in the loop.
     """
 
     pose_local_to_rig: QVec  # The pose of the vehicle in the local frame
     pose_local_to_rig_estimate: (
         QVec  # The "software" estimated pose of the vehicle in the local frame
     )
+    dynamic_state: DynamicState  # The true dynamic state (velocities, accelerations)
+    dynamic_state_estimated: DynamicState  # The estimated dynamic state
 
 
 class ControllerService(ServiceBase[VDCServiceStub]):
@@ -102,7 +104,9 @@ class ControllerService(ServiceBase[VDCServiceStub]):
         """Initialize a controller service session."""
         if self.stub:
             request = VDCSessionRequest(session_uuid=session_info.uuid)
-            await self.stub.start_session(request)
+            await profiled_rpc_call(
+                "start_session", "controller", self.stub.start_session, request
+            )
         else:
             if self.skip:
                 logger.info("Skip mode: no stub, session cannot be initialized")
@@ -114,8 +118,11 @@ class ControllerService(ServiceBase[VDCServiceStub]):
     async def _cleanup_session(self, session_info: SessionInfo, **kwargs: Any) -> None:
         """Cleanup resources associated with the session"""
         if self.stub:
-            await self.stub.close_session(
-                VDCSessionCloseRequest(session_uuid=session_info.uuid)
+            await profiled_rpc_call(
+                "close_session",
+                "controller",
+                self.stub.close_session,
+                VDCSessionCloseRequest(session_uuid=session_info.uuid),
             )
         else:
             if self.skip:
@@ -125,7 +132,6 @@ class ControllerService(ServiceBase[VDCServiceStub]):
                     "ControllerService stub is not initialized, cannot clean up session"
                 )
 
-    @timed_method("run_controller_and_vehicle")
     async def run_controller_and_vehicle(
         self,
         now_us: int,
@@ -169,7 +175,12 @@ class ControllerService(ServiceBase[VDCServiceStub]):
                 )
             )
         else:
-            response = await self.stub.run_controller_and_vehicle(request)
+            response = await profiled_rpc_call(
+                "run_controller_and_vehicle",
+                "controller",
+                self.stub.run_controller_and_vehicle,
+                request,
+            )
 
         await self.session_info.log_writer.log_message(
             LogEntry(controller_return=response)
@@ -180,6 +191,8 @@ class ControllerService(ServiceBase[VDCServiceStub]):
             pose_local_to_rig_estimate=QVec.from_grpc_pose(
                 response.pose_local_to_rig_estimated.pose
             ),
+            dynamic_state=response.dynamic_state,
+            dynamic_state_estimated=response.dynamic_state_estimated,
         )
 
     async def get_available_scenes(self) -> List[str]:

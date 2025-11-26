@@ -1,6 +1,6 @@
 """Configuration schema for VAM driver."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from omegaconf import MISSING
@@ -25,6 +25,7 @@ class InferenceConfig:
     image_width: int = MISSING  # Expected image width (VAM scales frames to 512 px)
     use_cameras: list[str] = MISSING  # List of cameras to use
     max_batch_size: int = MISSING  # Maximum batch size for inference
+    subsample_factor: int = 1
 
 
 @dataclass
@@ -50,6 +51,37 @@ class TrajectoryConfig:
 
 
 @dataclass
+class TrajectoryOptimizerConfig:
+    """Trajectory optimization configuration. (VaVam-Eco)"""
+
+    enabled: bool = False  # Whether to enable trajectory optimization
+
+    # Optimization weights
+    smoothness_weight: float = 1.0  # Weight for trajectory smoothness
+    deviation_weight: float = 0.1  # Weight for deviation from original
+    comfort_weight: float = 2.0  # Weight for comfort constraint penalty
+
+    max_iterations: int = 100  # Maximum optimization iterations
+
+    # Frenet retiming options
+    retime_in_frenet: bool = True  # Whether to redistribute waypoints along path
+    retime_alpha: float = 0.25  # Retiming strength [0,1]; higher = more front-loaded
+
+    # Vehicle constraints
+    max_deviation: float = 2.0  # Max deviation from original trajectory (meters)
+    max_heading_change: float = 0.5236  # Max heading change (~30 degrees)
+    max_speed: float = 15.0  # Maximum speed (m/s)
+    max_accel: float = 5.0  # Maximum acceleration (m/s²)
+
+    # Comfort limits (from PDMS spec)
+    max_abs_yaw_rate: float = 0.95  # rad/s
+    max_abs_yaw_acc: float = 1.93  # rad/s²
+    max_lon_acc_pos: float = 4.89  # m/s²
+    max_lon_acc_neg: float = -4.05  # m/s²
+    max_abs_lon_jerk: float = 8.37  # m/s³
+
+
+@dataclass
 class RectificationTargetConfig:
     """Target pinhole parameters for rectifying a rendered camera."""
 
@@ -60,10 +92,18 @@ class RectificationTargetConfig:
     tangential: tuple[float, ...] = ()
     thin_prism: tuple[float, ...] = ()
 
+    # We rectify a larger canvas and only crop in the end to allow for
+    # margin when applying the distortion of the pinhole camera.
+    max_overscan_scale: float = 2.0
+    safety_margin_px: int = 10
+
 
 @dataclass
 class VAMDriverConfig:
     """Main VAM driver configuration."""
+
+    # Logging level (DEBUG, INFO, WARNING, ERROR)
+    log_level: str = "INFO"
 
     # Model configuration
     model: ModelConfig = MISSING
@@ -75,11 +115,14 @@ class VAMDriverConfig:
     # Inference configuration
     inference: InferenceConfig = MISSING
 
-    # Route configuration
-    route: Optional[RouteConfig] = None
+    route: RouteConfig = field(default_factory=RouteConfig)
 
     # Trajectory configuration
     trajectory: TrajectoryConfig = MISSING
+
+    trajectory_optimizer: TrajectoryOptimizerConfig = field(
+        default_factory=TrajectoryOptimizerConfig
+    )
 
     # Output configuration
     output_dir: str = MISSING

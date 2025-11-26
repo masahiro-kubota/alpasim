@@ -28,8 +28,8 @@ from alpasim_runtime.services.service_base import (
     WILDCARD_SCENE_ID,
     ServiceBase,
     SessionInfo,
-    timed_method,
 )
+from alpasim_runtime.telemetry.rpc_wrapper import profiled_rpc_call
 from alpasim_utils.qvec import QVec
 from alpasim_utils.scenario import AABB, TrafficObjects
 from alpasim_utils.trajectory import Trajectory
@@ -113,8 +113,13 @@ class TrafficService(ServiceBase[TrafficServiceStub]):
 
         if self._metadata is None:
             async with self:
-                self._metadata = await self.stub.get_metadata(
-                    Empty(), wait_for_ready=True, timeout=self.connection_timeout_s
+                self._metadata = await profiled_rpc_call(
+                    "get_metadata",
+                    "traffic",
+                    self.stub.get_metadata,
+                    Empty(),
+                    wait_for_ready=True,
+                    timeout=self.connection_timeout_s,
                 )
 
         return self._metadata
@@ -133,7 +138,6 @@ class TrafficService(ServiceBase[TrafficServiceStub]):
 
     # Note: The pass-through methods have been removed and their logic merged into the public methods
 
-    @timed_method("initialize_session")
     async def _initialize_session(
         self, session_info: SessionInfo, **kwargs: Any
     ) -> None:
@@ -191,29 +195,31 @@ class TrafficService(ServiceBase[TrafficServiceStub]):
         )
 
         if self.skip:
-            logger.info("Skip mode: traffic start_session no-op")
+            logger.debug("Skip mode: traffic start_session no-op")
             return
 
-        await self.stub.start_session(session_request)
+        await profiled_rpc_call(
+            "start_session", "traffic", self.stub.start_session, session_request
+        )
 
-    @timed_method("cleanup_session")
     async def _cleanup_session(self, **kwargs: Any) -> None:
         """Clean up traffic session."""
         if self.skip:
-            logger.info("Skip mode: traffic close_session no-op")
+            logger.debug("Skip mode: traffic close_session no-op")
             # Clean up traffic-specific attributes
             if hasattr(self, "_traffic_objs"):
                 delattr(self, "_traffic_objs")
             return
 
         close_request = TrafficSessionCloseRequest(session_uuid=self.session_info.uuid)
-        await self.stub.close_session(close_request)
+        await profiled_rpc_call(
+            "close_session", "traffic", self.stub.close_session, close_request
+        )
 
         # Clean up traffic-specific attributes
         if hasattr(self, "_traffic_objs"):
             delattr(self, "_traffic_objs")
 
-    @timed_method("simulate_traffic")
     async def simulate_traffic(
         self,
         ego_aabb_pose_future: QVec,
@@ -241,13 +247,12 @@ class TrafficService(ServiceBase[TrafficServiceStub]):
             object_trajectory_updates=object_trajectory_updates,
         )
 
-        # Log request before skip check (preserving current behavior)
         await self.session_info.log_writer.log_message(
             LogEntry(traffic_request=traffic_request)
         )
 
         if self.skip:
-            logger.info("Skip mode: replaying traffic from recorded data")
+            logger.debug("Skip mode: replaying traffic from recorded data")
 
             # In skip mode, return traffic positions from recorded trajectories
             object_trajectory_updates = []
@@ -271,7 +276,9 @@ class TrafficService(ServiceBase[TrafficServiceStub]):
                 object_trajectory_updates=object_trajectory_updates
             )
         else:
-            traffic_return = await self.stub.simulate(traffic_request)
+            traffic_return = await profiled_rpc_call(
+                "simulate", "traffic", self.stub.simulate, traffic_request
+            )
 
         # Log response (in both skip and non-skip modes)
         await self.session_info.log_writer.log_message(

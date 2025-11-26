@@ -1,3 +1,4 @@
+nr_workers: 1
 endpoints:
   controller:
     n_concurrent_rollouts: 14
@@ -15,7 +16,6 @@ endpoints:
   trafficsim:
     n_concurrent_rollouts: 14
     skip: true
-save_dir: test_output
 enable_autoresume: false
 # Because we're running sensorsim in skip mode, make sure cameras are defined.
 extra_cameras:

@@ -3,18 +3,11 @@
 
 __version__ = (0, 3, 0)
 
-import logging
 import os
 import pathlib
 
 from alpasim_grpc import API_VERSION_MESSAGE
 from alpasim_grpc.v0.common_pb2 import VersionId
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s",
-    datefmt="%H:%M:%S",
-)
 
 source_directory = pathlib.Path(__file__).parent.resolve()
 git_hash = os.environ.get("GIT_HASH", "Unknown")

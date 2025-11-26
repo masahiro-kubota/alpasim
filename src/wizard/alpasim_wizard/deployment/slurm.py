@@ -277,9 +277,13 @@ class SlurmDeployment:
         if srun_command_str.endswith(" &"):
             srun_command_str = srun_command_str[:-2]
 
-        if container.context.cfg.wizard.slurm_gpu_partition is None:
+        if (
+            container.context.cfg.wizard.slurm_gpu_partition is None
+            and os.environ.get("SLURM_JOB_PARTITION") is None
+        ):
             raise ValueError(
-                "SLURM GPU partition must be set in wizard config for sbatch submission."
+                "SLURM GPU partition must be set in wizard config (wizard.slurm_gpu_partition) "
+                "or available via SLURM_JOB_PARTITION environment variable for sbatch submission."
             )
 
         if container.gpu is not None:
@@ -287,10 +291,12 @@ class SlurmDeployment:
                 raise ValueError(
                     "Jobs dispatched via wrap_in_sbatch_script should request gpu 0 or none at all."
                 )
+            gpu_partition = container.context.cfg.wizard.slurm_gpu_partition
+            if gpu_partition is None:
+                gpu_partition = os.environ.get("SLURM_JOB_PARTITION", "")
             bash_script_template = build_sbatch(
                 srun_command_str,
-                partition=container.context.cfg.wizard.slurm_gpu_partition
-                or os.environ.get("SLURM_JOB_PARTITION", ""),
+                partition=gpu_partition,
                 gpus=1,
             )
         else:

@@ -5,11 +5,11 @@ import asyncio
 
 import pytest
 from alpasim_grpc.v0 import sensorsim_pb2
-from alpasim_runtime.simulate.__main__ import aio_main, create_arg_parser
+from alpasim_runtime.simulate.__main__ import create_arg_parser, run_simulation
 
 
 @pytest.mark.asyncio
-async def test_mocks(monkeypatch: pytest.MonkeyPatch):
+async def test_mocks(monkeypatch: pytest.MonkeyPatch, tmp_path):
     async def fake_get_available_cameras(self, scene_id: str):
         del scene_id  # skip-specific scenes ignored in mock mode
         cameras = []
@@ -33,13 +33,18 @@ async def test_mocks(monkeypatch: pytest.MonkeyPatch):
         fake_get_available_cameras,
     )
 
+    # Create required run_metadata.yaml for get_run_name()
+    run_metadata = tmp_path / "run_metadata.yaml"
+    run_metadata.write_text("run_name: test_mocks\n")
+
     parser = create_arg_parser()
     parsed_args = parser.parse_args(
         [
             "--user-config=tests/data/mock/user-config.yaml",
             "--network-config=tests/data/mock/network-config.yaml",
             "--usdz-glob=tests/data/**/*.usdz",
+            f"--log-dir={tmp_path}",
         ]
     )
-    success = await asyncio.wait_for(aio_main(parsed_args), timeout=35)
+    success = await asyncio.wait_for(run_simulation(parsed_args), timeout=35)
     assert success

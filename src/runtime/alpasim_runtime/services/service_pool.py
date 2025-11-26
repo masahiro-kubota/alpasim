@@ -7,16 +7,10 @@ Service pool implementation for service architecture.
 
 from __future__ import annotations
 
-import asyncio
 from asyncio import Queue
 from typing import Any, Generic, List, Type, TypeVar
 
-from alpasim_grpc.v0.common_pb2 import VersionId
-from alpasim_runtime.config import (
-    EndpointAddresses,
-    ScenarioConfig,
-    SingleUserEndpointConfig,
-)
+from alpasim_runtime.config import ScenarioConfig
 from alpasim_runtime.services.service_base import ServiceBase
 
 ServiceType = TypeVar("ServiceType", bound=ServiceBase)
@@ -32,34 +26,36 @@ class ServicePool(Generic[ServiceType]):
     Generic service pool that works with any ServiceBase-derived service.
     """
 
-    def __init__(
-        self,
-        services: List[ServiceType],
-        version: VersionId,
-    ):
+    def __init__(self, services: List[ServiceType]):
         self.queue: Queue[ServiceType] = Queue()
         self.services = services
-        self.version = version
 
         # Add all services to the queue
         for service in services:
             self.queue.put_nowait(service)
 
     @classmethod
-    async def create(
+    async def create_from_allocation(
         cls,
         service_class: Type[ServiceType],
-        user_config: SingleUserEndpointConfig,
-        addresses: EndpointAddresses,
+        allocation: dict[str, int],  # address -> concurrency
+        skip: bool,
         connection_timeout_s: int,
         **service_kwargs: Any,
     ) -> ServicePool[ServiceType]:
-        """Create a service pool for the given service type."""
-        services: List[ServiceType] = []
-        versions: List[VersionId] = []
+        """Create a service pool from pre-computed allocation.
 
-        if user_config.skip:
-            # Skip mode: create single skip service
+        Args:
+            service_class: The service class to instantiate
+            allocation: Dict mapping address -> number of concurrent slots
+            skip: Whether this service is in skip mode
+            connection_timeout_s: Timeout for establishing connections
+            **service_kwargs: Additional kwargs passed to service constructor
+        """
+        services: List[ServiceType] = []
+
+        if skip:
+            # Skip mode: create skip services
             for i in range(NR_SKIP_SERVICES):
                 service = service_class(
                     "skip",
@@ -69,33 +65,22 @@ class ServicePool(Generic[ServiceType]):
                     **service_kwargs,
                 )
                 services.append(service)
-            versions.append(await service.get_version())
         else:
-            # Real mode: create services for each address/replica
-            for address in addresses.addresses:
-                for i in range(user_config.n_concurrent_rollouts):
+            # Real mode: create services based on allocation
+            service_id = 0
+            for address, n_concurrent in allocation.items():
+                for i in range(n_concurrent):
                     service = service_class(
                         address,
                         skip=False,
                         connection_timeout_s=connection_timeout_s,
-                        id=i,
+                        id=service_id,
                         **service_kwargs,
                     )
                     services.append(service)
+                    service_id += 1
 
-                # Get version from one instance per address
-                version = await services[-1].get_version()
-                versions.append(version)
-
-        # Verify all versions match
-        if not all(v.version_id == versions[0].version_id for v in versions):
-            raise AssertionError(
-                f"Incoherent versions: {[v.version_id for v in versions]}"
-            )
-
-        pool = cls(services, versions[0])
-
-        return pool
+        return cls(services)
 
     async def get(self) -> ServiceType:
         """Get a service instance from the pool."""
@@ -104,10 +89,6 @@ class ServicePool(Generic[ServiceType]):
     async def put_back(self, service: ServiceType) -> None:
         """Return a service instance to the pool."""
         await self.queue.put(service)
-
-    def get_version(self) -> VersionId:
-        """Get the version of services in this pool."""
-        return self.version
 
     def get_number_of_services(self) -> int:
         """Get the number of services in this pool."""
@@ -124,15 +105,3 @@ class ServicePool(Generic[ServiceType]):
         if self.services:
             return await self.services[0].find_scenario_incompatibilities(scenario)
         return []
-
-    async def shut_down(self) -> None:
-        """Shutdown all services in the pool."""
-        # Deduplicate services by address to avoid shutting down the same service multiple times
-        seen_addresses = set()
-        unique_services = []
-        for service in self.services:
-            if service.address not in seen_addresses:
-                seen_addresses.add(service.address)
-                unique_services.append(service)
-
-        await asyncio.gather(*[service.shut_down() for service in unique_services])

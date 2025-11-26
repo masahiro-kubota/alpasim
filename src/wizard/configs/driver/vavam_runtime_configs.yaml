@@ -10,20 +10,20 @@ runtime:
     time_start_offset_us: 500_000 # Needs to be in sync
     ego_mask_rig_config_id: null
 
-
     cameras:
-    -
-      height: 1080
-      width: 1920
-      logical_id: camera_front_wide_120fov
-      frame_interval_us: 500_000 # also needs to be in sync
-      shutter_duration_us: 30_000
-      first_frame_offset_us: -30_000
-
+      - height: 1080
+        width: 1920
+        logical_id: camera_front_wide_120fov
+        frame_interval_us: 500_000 # also needs to be in sync
+        shutter_duration_us: 30_000
+        first_frame_offset_us: -30_000
 
   extra_cameras:
-    # Original nuscenes pinhole reference for comparison:
-    # - logical_id: camera_front_wide_120fov
+    # # Original nuscenes pinhole reference for comparison:
+    - logical_id: camera_front_wide_120fov
+      rig_to_camera:
+        translation_m: [1.65897811, -0.01443456, 1.51539499]
+        rotation_xyzw: [-0.49929397355810856, 0.5039939168301356, -0.4972939976976715, 0.49939397235113037]
     #   intrinsics:
     #     model: opencv_pinhole
     #     opencv_pinhole:
@@ -33,37 +33,4 @@ runtime:
     #       tangential: [-0.00213, 0.000464]
     #       thin_prism: [0.0, 0.0, 0.0, 0.0]
     #   resolution_hw: [1080, 1920]
-    #   shutter_type: ???
-
-    # ftheta fit of the original nuscenes pinhole camera
-    - logical_id: camera_front_wide_120fov
-      rig_to_camera:
-        translation_m: [1.65897811, -0.01443456, 1.51539499]
-        rotation_xyzw: [-0.49929397355810856, 0.5039939168301356, -0.4972939976976715, 0.49939397235113037]
-      intrinsics:
-        model: ftheta
-        ftheta:
-          principal_point: [960.0, 560.0]
-          reference_poly: pixel_to_angle
-          pixeldist_to_angle:
-            - 0.0
-            - 0.0006426535728643898
-            - 2.9290745366238798e-08
-            - -7.137741840186205e-11
-            - 9.057684879375634e-14
-            - -3.389168594380901e-17
-          angle_to_pixeldist:
-            - 0.0
-            - 1545.959713199167
-            - 0.0
-            - -49.08918663212933
-            - 0.0
-            - -20.25276218435422
-          max_angle: 0.7327843587994716
-          linear_cde:
-            linear_c: 1.0
-            linear_d: 0.0
-            linear_e: 0.0
-          # RMSE ~1.30 px, max error ~5.33 px when fitting from the pinhole model.
-      resolution_hw: [1080, 1920]
-      shutter_type: ROLLING_TOP_TO_BOTTOM
+    #   shutter_type: ROLLING_TOP_TO_BOTTOM

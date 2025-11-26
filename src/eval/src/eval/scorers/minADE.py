@@ -100,6 +100,10 @@ class MinADEScorer(Scorer):
             else:
                 raise NotImplementedError(f"Invalid target: {self.target}")
 
+            # Skip if no sampled trajectories are available
+            if len(driver_response_at_time.sampled_trajectories) == 0:
+                continue
+
             relevant_sampled_trajectory_waypoints = np.array(
                 [
                     sampled_trajectory.interpolate_to_timestamps(

@@ -18,11 +18,6 @@ from alpasim_grpc.v0 import common_pb2, controller_pb2, controller_pb2_grpc
 
 import grpc
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger(__name__)
 
 
@@ -53,7 +48,7 @@ class VDCSimService(controller_pb2_grpc.VDCServiceServicer):
     def start_session(
         self, request: common_pb2.SessionRequestStatus, context: grpc.ServicerContext
     ):
-        logger.warning(
+        logger.info(
             f"start_session for session_uuid: {request.session_uuid} (currently a no-op)"
         )
         return common_pb2.SessionRequestStatus()
@@ -73,7 +68,7 @@ class VDCSimService(controller_pb2_grpc.VDCServiceServicer):
         request: controller_pb2.RunControllerAndVehicleModelRequest,
         context: grpc.ServicerContext,
     ):
-        logger.info(
+        logger.debug(
             f"run_controller_and_vehicle called for session_uuid: {request.session_uuid}"
         )
         with self._lock:
@@ -103,10 +98,23 @@ def serve(host, port: int, log_dir: str):
 
 
 if __name__ == "__main__":
-    args = argparse.ArgumentParser()
-    args.add_argument("--host", type=str, default="0.0.0.0")
-    args.add_argument("--port", type=int, help="Port to listen on", default=50051)
-    args.add_argument("--log_dir", type=str, default=".")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", type=str, default="0.0.0.0")
+    parser.add_argument("--port", type=int, help="Port to listen on", default=50051)
+    parser.add_argument("--log_dir", type=str, default=".")
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        help="Logging level (DEBUG, INFO, WARNING, ERROR)",
+    )
 
-    args = args.parse_args()
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     serve(args.host, args.port, args.log_dir)

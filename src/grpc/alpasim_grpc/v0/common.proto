@@ -36,6 +36,8 @@ message Pose {
 message DynamicState {
     Vec3 angular_velocity = 1;
     Vec3 linear_velocity = 2;
+    Vec3 linear_acceleration = 3;
+    Vec3 angular_acceleration = 4; 
 }
 
 message AABB { // axis aligned bounding box

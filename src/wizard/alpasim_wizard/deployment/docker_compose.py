@@ -202,6 +202,22 @@ class DockerComposeDeployment:
         for c in container_set.runtime or []:
             service = self._to_docker_compose_service(c)
             service["profiles"] = ["sim"]
+            # Runtime needs host PID namespace for process monitoring
+            service["pid"] = "host"
+            # Runtime needs access to all GPUs for telemetry/resource monitoring
+            service["deploy"] = {
+                "resources": {
+                    "reservations": {
+                        "devices": [
+                            {
+                                "driver": "nvidia",
+                                "count": "all",
+                                "capabilities": ["gpu"],
+                            }
+                        ]
+                    }
+                }
+            }
             services[c.uuid] = service
 
         # Phase 2: Evaluation services

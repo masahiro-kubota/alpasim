@@ -26,11 +26,6 @@ from alpasim_utils.artifact import Artifact
 
 import grpc
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger(__name__)
 
 
@@ -74,7 +69,7 @@ class PhysicsSimService(PhysicsServiceServicer):
     def ground_intersection(
         self, request: PhysicsGroundIntersectionRequest, context: grpc.ServicerContext
     ) -> PhysicsGroundIntersectionReturn:
-        logger.info(f"Recieved request for scene_id={request.scene_id}")
+        logger.debug(f"Received request for scene_id={request.scene_id}")
         logger.debug(f"full request={request}")
         try:
             backend = self.get_backend(request.scene_id)
@@ -114,7 +109,7 @@ class PhysicsSimService(PhysicsServiceServicer):
                         for pose, status in other_updates
                     ],
                 )
-            logger.info("sending response")
+            logger.debug("sending response")
             return response
         except Exception as e:
             context.set_code(grpc.StatusCode.UNKNOWN)
@@ -159,12 +154,31 @@ def parse_args(
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--use-ground-mesh", type=bool, default=False)
     parser.add_argument("--visualize", type=bool, default=False)
+    parser.add_argument(
+        "--cache-size",
+        type=int,
+        default=16,
+        help="Number of scene backends to keep in LRU cache. Set to match or exceed concurrent scenes.",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        help="Logging level (DEBUG, INFO, WARNING, ERROR)",
+    )
     args, overrides = parser.parse_known_args(arg_list)
     return args, overrides
 
 
 def main(arg_list: list[str] | None = None) -> None:
     args, _ = parse_args(arg_list)
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     logger.info(f"Identifying as\n{VERSION_MESSAGE}")
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
@@ -174,6 +188,7 @@ def main(arg_list: list[str] | None = None) -> None:
     service = PhysicsSimService(
         server,
         args.artifact_glob,
+        cache_size=args.cache_size,
         use_ground_mesh=args.use_ground_mesh,
         visualize=args.visualize,
     )

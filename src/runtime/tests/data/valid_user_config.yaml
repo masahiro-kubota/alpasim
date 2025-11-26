@@ -11,8 +11,6 @@ endpoints:
     skip: false
   do_shutdown: true
 
-save_dir: "test_output"
-
 scenarios:
   -
     scene_id: "clipgt-f94a6ae5-019e-4467-840f-5376b5255828"

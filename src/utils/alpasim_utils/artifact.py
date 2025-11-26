@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import glob
 import logging
+import threading
 import zipfile
 from dataclasses import dataclass, field
 from typing import Optional
@@ -91,17 +92,35 @@ class Artifact:
     _attempted_map_load: bool = False
     _mesh_ply: bytes | None = None
 
+    # Thread-safety lock for lazy-loaded properties (especially map loading)
+    # Using field(default_factory=...) to create a lock per instance
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
     def __post_init__(self) -> None:
         assert self.source.endswith(".usdz")
 
+    def __getstate__(self) -> dict:
+        """Return state for pickling, excluding the non-picklable lock."""
+        state = self.__dict__.copy()
+        # Remove the lock from the state - it cannot be pickled
+        del state["_lock"]
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore state after unpickling, recreating the lock."""
+        self.__dict__.update(state)
+        # Recreate the lock in the new process
+        self._lock = threading.Lock()
+
     def clear_cache(self) -> None:
         """Clear cached data"""
-        self._metadata = None
-        self._rig = None
-        self._traffic_objects = None
-        self._map = None
-        self._attempted_map_load = False
-        self._mesh_ply = None
+        with self._lock:
+            self._metadata = None
+            self._rig = None
+            self._traffic_objects = None
+            self._map = None
+            self._attempted_map_load = False
+            self._mesh_ply = None
 
     @staticmethod
     def discover_from_glob(
@@ -199,35 +218,47 @@ class Artifact:
                 "Install trajdata to enable map loading."
             )
             return None
+
+        # Fast path: if already loaded, return cached result (no lock needed)
         if self._attempted_map_load:
             return self._map
-        self._attempted_map_load = True
 
-        logger.info(
-            "Loading USDZ map data into memory. This will take a few seconds..."
-        )
+        # Slow path: acquire lock to ensure thread-safe lazy loading
+        with self._lock:
+            # Double-check after acquiring lock (another thread may have loaded it)
+            if self._attempted_map_load:
+                return self._map
 
-        self._map = VectorMap(map_id=f"alpasim_usdz:{self.metadata.scene_id}")
-
-        # Try loading map data
-        map_loaded = False
-        with zipfile.ZipFile(self.source, "r") as zip_file:
-            # Try loading from different sources in order of preference
-            if self._load_xodr_map(zip_file):
-                map_loaded = True
-                logger.info("Successfully loaded map from XODR")
-
-        if not map_loaded:
-            logger.warning(
-                f"No map data (clipgt or XODR) found in {self.source}. "
-                "Skipping map loading."
+            logger.info(
+                "Loading USDZ map data into memory. This will take a few seconds..."
             )
-            self._map = None
-            return None
 
-        # Post-process the loaded map
-        self._finalize_map()
-        return self._map
+            self._map = VectorMap(map_id=f"alpasim_usdz:{self.metadata.scene_id}")
+
+            # Try loading map data
+            map_loaded = False
+            with zipfile.ZipFile(self.source, "r") as zip_file:
+                # Try loading map from xodr
+                if self._load_xodr_map(zip_file):
+                    map_loaded = True
+                    logger.info("Successfully loaded map from XODR")
+
+            if not map_loaded:
+                logger.warning(
+                    f"No map data (XODR) found in {self.source}. "
+                    "Skipping map loading."
+                )
+                self._map = None
+                # Mark as attempted AFTER setting _map to None (load complete)
+                self._attempted_map_load = True
+                return None
+
+            # Post-process the loaded map (builds KDTree search indices)
+            self._finalize_map()
+
+            # Mark as attempted AFTER map is fully loaded and finalized
+            self._attempted_map_load = True
+            return self._map
 
     def _load_xodr_map(self, zip_file: zipfile.ZipFile) -> bool:
         """Load map from XODR file.

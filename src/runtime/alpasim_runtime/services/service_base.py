@@ -10,15 +10,13 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from functools import wraps
 from types import TracebackType
-from typing import Any, Callable, Dict, Generic, List, Optional, Type, TypeVar
+from typing import Any, Dict, Generic, List, Optional, Type, TypeVar
 
 from alpasim_grpc import API_VERSION_MESSAGE
 from alpasim_grpc.v0.common_pb2 import Empty, VersionId
 from alpasim_runtime.config import ScenarioConfig
 from alpasim_runtime.logs import LogWriter
-from alpasim_runtime.metrics import time_async
 
 import grpc
 
@@ -36,22 +34,6 @@ class SessionInfo:
     uuid: str
     log_writer: LogWriter
     additional_args: Dict[str, Any]
-
-
-def timed_method(method_name: str) -> Callable:
-    """Decorator for timing service methods using Prometheus metrics."""
-
-    def decorator(func: Callable) -> Callable:
-        @wraps(func)
-        async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-            # Apply timing to the actual service call
-            return await time_async(func, method_name, self.__class__.__name__)(
-                self, *args, **kwargs
-            )
-
-        return wrapper
-
-    return decorator
 
 
 class ServiceBase(ABC, Generic[StubType]):
@@ -209,9 +191,3 @@ class ServiceBase(ABC, Generic[StubType]):
             )
 
         return incompatibilities
-
-    async def shut_down(self) -> None:
-        """Shutdown the service."""
-        if not self.skip:
-            async with self:
-                await self.stub.shut_down(Empty(), timeout=1.0)

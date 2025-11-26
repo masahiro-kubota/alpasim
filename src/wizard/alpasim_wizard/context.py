@@ -250,7 +250,7 @@ def create_port_assigner(baseport: int) -> Iterator[int]:
 
     def port_assigner() -> Iterator[int]:
         ports_assigned = 0
-        max_ports = 100
+        max_ports = 1000
         # Start from the first available port >= baseport
         next_port = _find_next_open_port(baseport)
 

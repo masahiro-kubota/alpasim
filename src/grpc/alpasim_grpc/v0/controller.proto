@@ -60,4 +60,10 @@ message RunControllerAndVehicleModelResponse {
 
   // Estimated active transform local->rig after propagation.
   common.PoseAtTime pose_local_to_rig_estimated = 2;
+
+  // Ground-truth dynamic state (velocity, acceleration) in rig frame after propagation.
+  common.DynamicState dynamic_state = 3;
+
+  // Estimated dynamic state in rig frame after propagation.
+  common.DynamicState dynamic_state_estimated = 4;
 }

@@ -9,37 +9,37 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import concurrent.futures
 import logging
-import multiprocessing as mp
 import os
 import random
 import sys
-import time
-import traceback
+from pathlib import Path
+from uuid import uuid4
 
+import yaml
+from alpasim_grpc.v0.common_pb2 import Empty
 from alpasim_runtime.autoresume import (
     find_num_complete_rollouts,
     remove_incomplete_rollouts,
 )
-from alpasim_runtime.camera_catalog import CameraCatalog
 from alpasim_runtime.config import (
     NetworkSimulatorConfig,
     SimulatorConfig,
     UserSimulatorConfig,
     typed_parse_config,
 )
-from alpasim_runtime.dispatcher import Dispatcher
-from alpasim_runtime.loop import UnboundRollout
-from alpasim_runtime.metrics import dump_prometheus_metrics
-from alpasim_runtime.scene_cache_monitor import SceneCacheMonitor
-from alpasim_utils.artifact import Artifact
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s",
-    datefmt="%H:%M:%S",
+from alpasim_runtime.endpoints import get_service_endpoints
+from alpasim_runtime.telemetry.plot_metrics import generate_metrics_plot
+from alpasim_runtime.telemetry.utils import merge_metrics_files
+from alpasim_runtime.validation import (
+    gather_versions_from_addresses,
+    validate_scenarios,
 )
+from alpasim_runtime.worker.ipc import RolloutJob
+from alpasim_runtime.worker.pool import run_workers
+
+import grpc
+
 logger = logging.getLogger(__name__)
 
 
@@ -54,6 +54,13 @@ def parse_config(user_config_path: str, network_config_path: str) -> SimulatorCo
     return SimulatorConfig(user=user_config, network=network_config)
 
 
+def get_run_name(log_dir: str) -> str:
+    run_metadata_path = os.path.join(log_dir, "run_metadata.yaml")
+    with open(run_metadata_path, "r") as f:
+        run_metadata = yaml.safe_load(f)
+    return run_metadata.get("run_name")
+
+
 def create_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
@@ -62,114 +69,132 @@ def create_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--network-config", type=str, required=True)
     parser.add_argument("--usdz-glob", type=str, required=True)
     parser.add_argument(
-        "--prometheus-out",
+        "--log-dir",
+        type=str,
+        required=True,
+        help="Root directory for all simulation outputs (asl/, metrics/, txt-logs/)",
+    )
+
+    parser.add_argument(
+        "--log-level",
         type=str,
         required=False,
-        default=None,
+        default="INFO",
+        help="Python logging level (e.g. DEBUG, INFO, WARNING, ERROR)",
     )
 
     return parser
 
 
-async def aio_main(args: argparse.Namespace) -> bool:
+def build_job_list(config: SimulatorConfig, asl_dir: str) -> list[RolloutJob]:
+    """Build list of jobs to execute, respecting autoresume settings."""
+    jobs = []
+    for scenario in config.user.scenarios:
+        n_rollouts_to_dispatch = scenario.n_rollouts
 
+        # Handle autoresume: skip already-completed rollouts
+        if config.user.enable_autoresume:
+            remove_incomplete_rollouts(asl_dir, scenario.scene_id)
+            num_finished_rollouts = find_num_complete_rollouts(
+                asl_dir, scenario.scene_id
+            )
+            if num_finished_rollouts > 0:
+                logger.info(
+                    f"Found {num_finished_rollouts} already completed rollouts for "
+                    f"scene_id={scenario.scene_id}"
+                )
+                n_rollouts_to_dispatch -= num_finished_rollouts
+
+        # Create jobs for remaining rollouts
+        for _ in range(n_rollouts_to_dispatch):
+            jobs.append(
+                RolloutJob(
+                    job_id=uuid4().hex,
+                    scenario=scenario,
+                    seed=random.randint(0, 2**32 - 1),
+                )
+            )
+
+    logger.info("Built %d jobs to execute", len(jobs))
+    return jobs
+
+
+async def shutdown_services(config: SimulatorConfig) -> None:
+    """Shut down all services by sending shutdown command to each unique address."""
+    if not config.user.endpoints.do_shutdown:
+        logger.info("Skipping service shutdown (do_shutdown=False)")
+        return
+
+    logger.info("Shutting down services...")
+
+    service_endpoints = get_service_endpoints(config.network)
+
+    for stub_class, addresses in service_endpoints.values():
+        for address in addresses:
+            try:
+                channel = grpc.aio.insecure_channel(address)
+                stub = stub_class(channel)
+                await stub.shut_down(Empty(), timeout=5.0)
+                await channel.close()
+            except Exception as e:
+                # Service may already be shut down or unreachable - that's OK
+                logger.debug("Failed to shut down %s: %s", address, e)
+
+    logger.info("Service shutdown complete")
+
+
+async def run_simulation(args: argparse.Namespace) -> bool:
+    """Main simulation orchestration."""
     config = parse_config(args.user_config, args.network_config)
 
-    artifacts = Artifact.discover_from_glob(
-        args.usdz_glob, smooth_trajectories=config.user.smooth_trajectories
+    # Derive output directories from log_dir
+    asl_dir = os.path.join(args.log_dir, "asl")
+    metrics_dir = os.path.join(args.log_dir, "metrics")
+
+    nr_workers = config.user.nr_workers
+
+    # Validate nr_workers
+    if nr_workers < 1:
+        raise ValueError(f"nr_workers must be >= 1, got {nr_workers}")
+
+    # Health check: probe all services to ensure they're ready before spawning workers.
+    await gather_versions_from_addresses(
+        config.network,
+        timeout_s=config.user.endpoints.startup_timeout_s,
     )
 
-    logger.info(f"Available artifacts: {list(artifacts.keys())}.")
+    await validate_scenarios(config)
+    jobs = build_job_list(config, asl_dir)
 
-    camera_catalog = CameraCatalog(config.user.extra_cameras)
-    sensorsim_scene_cache_monitor = SceneCacheMonitor(
-        config.user.endpoints.sensorsim_cache_size
+    if not jobs:
+        logger.info("No jobs to run (all rollouts already complete or no scenarios).")
+        return True
+
+    try:
+        results = await run_workers(config, args, jobs, args.log_dir)
+    finally:
+        await shutdown_services(config)
+
+    # Check for failures
+    success = all(r.success for r in results)
+    if not success:
+        failed = [r for r in results if not r.success]
+        logger.error("%d jobs failed:", len(failed))
+        for r in failed[:3]:
+            logger.error("  Job %s: %s", r.job_id, r.error)
+        if len(failed) > 3:
+            logger.error("  ... and %d more", len(failed) - 3)
+
+    # Merge metrics files
+    merge_metrics_files(metrics_dir)
+
+    # Generate metrics visualization plot
+    output_path = generate_metrics_plot(
+        metrics_path=Path(metrics_dir) / "metrics.prom",
+        output_path=Path(args.log_dir) / "metrics_plot.png",
+        run_name=get_run_name(args.log_dir),
     )
-
-    dispatcher = await Dispatcher.create(
-        user_config=config.user.endpoints,
-        network_config=config.network,
-        camera_catalog=camera_catalog,
-        sensorsim_scene_cache_monitor=sensorsim_scene_cache_monitor,
-    )
-
-    version_ids = dispatcher.gather_version_ids()
-
-    rollout_futures: list[concurrent.futures.Future] = []
-    rollouts: list[UnboundRollout] = []
-
-    error_messages: list[str] = []
-    future_to_scene = {}
-
-    physical_cores = os.cpu_count()
-
-    ctx = mp.get_context("spawn")
-
-    with concurrent.futures.ProcessPoolExecutor(
-        max_workers=2 * physical_cores, mp_context=ctx
-    ) as executor:
-        for scenario in config.user.scenarios:
-            error_messages.extend(
-                await dispatcher.find_scenario_incompatibilities(scenario)
-            )
-
-            n_rollouts_to_dispatch = scenario.n_rollouts
-            if config.user.enable_autoresume:
-                remove_incomplete_rollouts(config.user.save_dir, scenario.scene_id)
-                num_finished_rollouts = find_num_complete_rollouts(
-                    config.user.save_dir, scenario.scene_id
-                )
-                if num_finished_rollouts != 0:
-                    logger.info(
-                        f"Found {num_finished_rollouts} already completed rollouts for {scenario.scene_id=}"
-                    )
-                    n_rollouts_to_dispatch -= num_finished_rollouts
-
-            while n_rollouts_to_dispatch > 0:
-                submission = executor.submit(
-                    UnboundRollout.create,
-                    config=config.user,
-                    scenario=scenario,
-                    version_ids=version_ids,
-                    random_seed=random.randint(0, 2**32 - 1),
-                    available_artifacts=artifacts,
-                )
-                rollout_futures.append(submission)
-                future_to_scene[submission] = scenario.scene_id
-                n_rollouts_to_dispatch -= 1
-
-        for rollout_future in rollout_futures:
-            try:
-                rollouts.append(rollout_future.result())
-            except Exception as exc:
-                logger.warn(f"error with {future_to_scene[rollout_future]}")
-                message = f"Error with scenario.scene_id = {future_to_scene[rollout_future]}:\n"
-                message += "\n".join(traceback.format_exception(exc))
-                error_messages.append(
-                    message
-                )  # since error_messages is not empty, we will raise in a moment
-
-    if error_messages:
-        raise AssertionError("\n".join(error_messages))
-
-    start_time = time.perf_counter()
-    success = await dispatcher.dispatch_rollouts(rollouts)
-    total_time = time.perf_counter() - start_time
-    logger.info(
-        "Simulated %d rollouts in %.2f seconds, i.e. %.2f seconds per rollout",
-        len(rollouts),
-        total_time,
-        total_time / len(rollouts) if len(rollouts) > 0 else 0,
-    )
-
-    if args.prometheus_out is not None:
-        try:
-            dump_prometheus_metrics(args.prometheus_out)
-        except Exception as e:
-            logger.warn(
-                f"Failed to write prometheus metrics to disk (to location: {args.prometheus_out}). "
-                f"Error: {str(e)}. The test can still pass."
-            )
+    logger.info("Generated metrics plot: %s", output_path)
 
     return success
 
@@ -178,7 +203,13 @@ if __name__ == "__main__":
     parser = create_arg_parser()
     args = parser.parse_args()
 
-    success = asyncio.run(aio_main(args))
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), None),
+        format="%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    success = asyncio.run(run_simulation(args))
     logging.info("Alpasim finished.")
 
     sys.exit(0 if success else 1)

@@ -9,6 +9,7 @@ defaults:
 defines:
   filesystem: "/lustre/fs12/portfolios/av/projects/av_alpamayo_sim/.cache"
   nre_cache_size: 8
+  physics_cache_size: 16  # should match or exceed concurrent unique scenes
 
 wizard:
     run_method: "SLURM"

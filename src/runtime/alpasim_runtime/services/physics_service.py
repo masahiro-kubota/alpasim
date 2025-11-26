@@ -13,7 +13,8 @@ from alpasim_grpc.v0.physics_pb2 import PhysicsGroundIntersectionRequest
 from alpasim_grpc.v0.physics_pb2_grpc import PhysicsServiceStub
 from alpasim_runtime.config import PhysicsUpdateMode, ScenarioConfig
 from alpasim_runtime.logs import LogEntry
-from alpasim_runtime.services.service_base import ServiceBase, timed_method
+from alpasim_runtime.services.service_base import ServiceBase
+from alpasim_runtime.telemetry.rpc_wrapper import profiled_rpc_call
 from alpasim_utils.qvec import QVec
 from alpasim_utils.scenario import AABB
 
@@ -32,7 +33,6 @@ class PhysicsService(ServiceBase[PhysicsServiceStub]):
     def stub_class(self) -> Type[PhysicsServiceStub]:
         return PhysicsServiceStub
 
-    @timed_method("ground_intersection")
     async def ground_intersection(
         self,
         scene_id: str,
@@ -75,7 +75,9 @@ class PhysicsService(ServiceBase[PhysicsServiceStub]):
             LogEntry(physics_request=request)
         )
 
-        response = await self.stub.ground_intersection(request)
+        response = await profiled_rpc_call(
+            "ground_intersection", "physics", self.stub.ground_intersection, request
+        )
 
         await self.session_info.log_writer.log_message(
             LogEntry(physics_return=response)

@@ -12,13 +12,14 @@ import asyncio
 import contextlib
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass, field, replace
 from types import TracebackType
 from typing import Optional, Self, Type
 
 import numpy as np
-from alpasim_grpc.v0.common_pb2 import PoseAtTime
+from alpasim_grpc.v0.common_pb2 import DynamicState, PoseAtTime
 from alpasim_grpc.v0.logging_pb2 import ActorPoses, LogEntry, RolloutMetadata
 from alpasim_grpc.v0.traffic_pb2 import TrafficReturn
 from alpasim_runtime.autoresume import mark_rollout_complete
@@ -26,7 +27,6 @@ from alpasim_runtime.camera_catalog import CameraCatalog
 from alpasim_runtime.config import (
     EgomotionNoiseModelConfig,
     PhysicsUpdateMode,
-    RoadCastConfig,
     RouteGeneratorType,
     RuntimeCameraConfig,
     ScenarioConfig,
@@ -45,6 +45,7 @@ from alpasim_runtime.services.driver_service import DriverService
 from alpasim_runtime.services.physics_service import PhysicsService
 from alpasim_runtime.services.sensorsim_service import ImageFormat, SensorsimService
 from alpasim_runtime.services.traffic_service import TrafficService
+from alpasim_runtime.telemetry.telemetry_context import try_get_context
 from alpasim_runtime.types import Clock, RuntimeCamera
 from alpasim_utils.artifact import Artifact
 from alpasim_utils.logs import LogWriter
@@ -123,7 +124,6 @@ class UnboundRollout:
     nre_version: str
     nre_uuid: str
     vehicle_config: VehicleConfig
-    roadcast_config: RoadCastConfig
 
     vector_map: Optional[VectorMap] = None
     follow_log: Optional[str] = None
@@ -141,6 +141,7 @@ class UnboundRollout:
         version_ids: RolloutMetadata.VersionIds,
         random_seed: int,
         available_artifacts: dict[str, Artifact],
+        asl_dir: str,
     ) -> UnboundRollout:
 
         # TODO: for now we assume there's a single sequence per NRE scene
@@ -236,7 +237,7 @@ class UnboundRollout:
             force_gt_duration_us=scenario.force_gt_duration_us,
             control_timestep_us=scenario.control_timestep_us,
             follow_log=None,
-            save_path_root=os.path.join(config.save_dir, scenario.scene_id),
+            save_path_root=os.path.join(asl_dir, scenario.scene_id),
             time_start_offset_us=scenario.time_start_offset_us,
             version_ids=version_ids,
             camera_configs=camera_configs,
@@ -263,7 +264,6 @@ class UnboundRollout:
             send_recording_ground_truth=scenario.send_recording_ground_truth,
             vehicle_config=vehicle,
             vector_map=artifact.map,
-            roadcast_config=config.roadcast,
             hidden_traffic_objs=hidden_traffic_objs,
             group_render_requests=scenario.group_render_requests,
         )
@@ -325,6 +325,8 @@ class BoundRollout:
         init=False
     )  # the estimated (possibly noisy) trajectory of the ego vehicle
     traffic_objs: TrafficObjects = field(init=False)
+    # Latest estimated dynamic state from the controller (velocities, accelerations in rig frame)
+    dynamic_state_estimated: DynamicState = field(init=False)
 
     log_writer: LogWriterManager = field(init=False)
     planner_delay_buffer: DelayBuffer = field(init=False)
@@ -354,6 +356,8 @@ class BoundRollout:
                 np.array([prerun_start_us, prerun_end_us], dtype=np.uint64)
             )
         )
+        # Initialize estimated dynamic state with default/empty values
+        self.dynamic_state_estimated = DynamicState()
 
         self.planner_delay_buffer = DelayBuffer(self.unbound.planner_delay_us)
         self.egomotion_noise_model = EgomotionNoiseModel.from_config(
@@ -451,7 +455,10 @@ class BoundRollout:
         ego_trajectory = self.ego_trajectory_estimate.interpolate_to_timestamps(
             np.array([t.time_range_us.start for t in triggers], dtype=np.uint64)
         )
-        await self.driver.submit_trajectory(ego_trajectory)
+        await self.driver.submit_trajectory(
+            ego_trajectory,
+            self.dynamic_state_estimated,
+        )
 
     async def send_route(self, timestamp_us: int) -> None:
         if self.ego_trajectory.timestamps_us[-1] != timestamp_us:
@@ -487,6 +494,7 @@ class BoundRollout:
         local_to_rig_estimate_future: QVec,
         traffic_poses_future: dict[str, QVec],
         future_us: int,
+        dynamic_state_estimated: DynamicState,
     ) -> None:
         dt_sec = (future_us - self.ego_trajectory_estimate.time_range_us.stop) / 1e6
         pose_rig_to_noisy_rig = (
@@ -502,6 +510,8 @@ class BoundRollout:
         self.ego_trajectory_estimate.update_absolute(
             future_us, local_to_rig_estimate_future @ pose_rig_to_noisy_rig
         )
+        # Store the latest estimated dynamic state for use in egomotion observations
+        self.dynamic_state_estimated = dynamic_state_estimated
         for obj_id, obj_pose_future in traffic_poses_future.items():
             if obj_id == "EGO":
                 continue  # traffic model also models ego trajectory but we don't need that
@@ -563,6 +573,9 @@ class BoundRollout:
 
         # gather stateful objects which need to be opened/closed via `async with`
         async with contextlib.AsyncExitStack() as async_stack:
+            # Track rollout timing
+            rollout_start_time = time.perf_counter()
+
             # create rollouts first since they contain LogWriters which need to be active by the time we create sessions
             await async_stack.enter_async_context(self)
 
@@ -644,12 +657,31 @@ class BoundRollout:
                     self.ego_trajectory,
                 )
 
-            logger.info(f"Starting session {self.unbound.rollout_uuid}.")
+            logger.info(
+                "Session STARTING: uuid=%s scene=%s steps=%d seed=%d",
+                self.unbound.rollout_uuid,
+                self.unbound.scene_id,
+                self.unbound.n_sim_steps,
+                self.unbound.random_seed,
+            )
+
             await self._loop()
+
+            # Record rollout duration
+            rollout_duration = time.perf_counter() - rollout_start_time
+            ctx = try_get_context()
+            if ctx is not None:
+                ctx.rollout_duration.observe(rollout_duration)
+
             mark_rollout_complete(
                 self.unbound.save_path_root, self.unbound.rollout_uuid
             )
-            logger.info(f"Session {self.unbound.rollout_uuid} finished.")
+            logger.info(
+                "Session COMPLETED: uuid=%s scene=%s duration=%.2fs",
+                self.unbound.rollout_uuid,
+                self.unbound.scene_id,
+                rollout_duration,
+            )
 
     async def _send_images(self, past_us: int, now_us: int) -> None:
         camera_triggers = []
@@ -738,6 +770,8 @@ class BoundRollout:
         # the previous and current step and ask it to predict position for the next step
         # -> we clip the first and last control intervals from the range.
         for control_step in range(1, len(self.unbound.control_timestamps_us) - 1):
+            step_start = time.perf_counter()
+
             logger.info(f"session {self.unbound.rollout_uuid}, step {control_step}.")
 
             past_us = self.unbound.control_timestamps_us[control_step - 1]
@@ -816,7 +850,14 @@ class BoundRollout:
                 local_to_rig_estimate_future=propagated_poses.pose_local_to_rig_estimate,
                 traffic_poses_future=traffic_poses_future,
                 future_us=future_us,
+                dynamic_state_estimated=propagated_poses.dynamic_state_estimated,
             )
+
+            # Record step duration
+            step_duration = time.perf_counter() - step_start
+            ctx = try_get_context()
+            if ctx is not None:
+                ctx.step_duration.observe(step_duration)
 
         # Send last images so we have them in the logsuntil the rollout end
         if len(self.unbound.control_timestamps_us) >= 2:

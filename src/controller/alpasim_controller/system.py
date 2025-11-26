@@ -3,13 +3,20 @@
 
 import logging
 import math
+import warnings
 from dataclasses import dataclass
 
-import casadi
-import do_mpc
-import numpy as np
-from alpasim_grpc.v0 import common_pb2, controller_pb2
-from alpasim_utils import trajectory
+# Suppress do_mpc warnings BEFORE importing - warnings trigger at import time
+# We don't use the ONNX sysid or opcua features, and the SyntaxWarning is a bug in do_mpc
+warnings.filterwarnings("ignore", message="The ONNX feature is not available")
+warnings.filterwarnings("ignore", message="The opcua feature is not available")
+warnings.filterwarnings("ignore", message='"is" with a literal', category=SyntaxWarning)
+
+import casadi  # noqa: E402
+import do_mpc  # noqa: E402
+import numpy as np  # noqa: E402
+from alpasim_grpc.v0 import common_pb2, controller_pb2  # noqa: E402
+from alpasim_utils import trajectory  # noqa: E402
 
 
 class VehicleModel:
@@ -86,21 +93,36 @@ class VehicleModel:
                 0.0,
             ]
         )
+        # Store the last computed accelerations (derivatives of velocity states)
+        # [d_v_cg_x (longitudinal accel), d_v_cg_y (lateral accel), d_yaw_rate (angular accel)]
+        self._accelerations = np.array([0.0, 0.0, 0.0])
 
     @property
-    def parameters(self):
+    def parameters(self) -> "VehicleModel.Parameters":
         """Getter for the vehicle parameters."""
         return self._parameters
 
     @property
-    def state(self):
+    def state(self) -> np.ndarray:
         """Getter for the vehicle state."""
         return self._state
 
     @property
-    def front_steering_angle(self):
+    def front_steering_angle(self) -> float:
         """Getter for the front steering angle."""
         return self._state[6]
+
+    @property
+    def accelerations(self) -> np.ndarray:
+        """
+        Getter for the last computed accelerations in the CG frame.
+        Returns:
+            Array of [d_v_cg_x, d_v_cg_y, d_yaw_rate] where:
+            - d_v_cg_x: longitudinal acceleration at CG [m/s²]
+            - d_v_cg_y: lateral acceleration at CG [m/s²]
+            - d_yaw_rate: angular acceleration (yaw) [rad/s²]
+        """
+        return self._accelerations
 
     def reset_origin(self) -> None:
         """Reset the state to the origin (x, y, yaw) = 0."""
@@ -116,7 +138,7 @@ class VehicleModel:
         self._state[3] = v_cg_x
         self._state[4] = v_cg_y
 
-    def advance(self, u: np.array, dt: float) -> trajectory.QVec:
+    def advance(self, u: np.ndarray, dt: float) -> trajectory.QVec:
         """
         Advances the vehicle model by dt seconds using a 2nd order Runge-Kutta method.
         Args:
@@ -129,7 +151,7 @@ class VehicleModel:
         """
         DT_STEP_MAX = 0.01
 
-        logging.debug(f"state: {self._state}, u: {u}, dt: {dt}")
+        logging.debug("state: %s, u: %s, dt: %s", self._state, u, dt)
         total_time = 0.0
         while total_time < dt:
             if dt - total_time > DT_STEP_MAX:
@@ -144,7 +166,16 @@ class VehicleModel:
             k2 = step_dt * self._derivs(self._state + k1 / 2.0, u)
             self._state += k2
             self._state[3] = max(0.0, self._state[3])  # Ensure non-negative velocity
-        logging.debug(f"state (after prop): {self._state}")
+
+        # Store the final accelerations (derivatives at the end state)
+        # derivs returns [dx, dy, dyaw, d_v_x, d_v_y, d_yaw_rate, d_steering, d_accel]
+        final_derivs = self._derivs(self._state, u)
+        # d_v_x is the longitudinal acceleration (state[7]), d_v_y and d_yaw_rate are computed
+        self._accelerations = np.array(
+            [final_derivs[3], final_derivs[4], final_derivs[5]]
+        )
+
+        logging.debug("state (after prop): %s", self._state)
         return trajectory.QVec(
             vec3=np.array([self._state[0], self._state[1], 0]),
             quat=np.array(
@@ -152,7 +183,7 @@ class VehicleModel:
             ),
         )
 
-    def _derivs(self, state, u):
+    def _derivs(self, state: np.ndarray, u: np.ndarray) -> np.ndarray:
 
         # Grab states
         yaw_angle = state[2]
@@ -309,8 +340,14 @@ class System:
         self._model = System._build_model(self._vehicle_model.parameters)
         self._setup_mpc()
 
-        self._log_file_handle = open(log_file, "w")
+        self._log_file_handle = open(log_file, "w", encoding="utf-8")
         self._log_header()
+        # Initialize attributes that will be set during stepping.
+        # Done to satisfy the type checking gods.
+        self._first_reference_pose_rig: trajectory.QVec = trajectory.QVec(
+            vec3=np.array([0, 0, 0]), quat=np.array([0, 0, 0, 1])
+        )
+        self.control_input: np.ndarray = np.array([[0.0], [0.0]])
 
     def _dynamic_state_to_cg_velocity(
         self, dynamic_state: common_pb2.DynamicState
@@ -447,7 +484,7 @@ class System:
         model.setup()
         return model
 
-    def _setup_mpc(self):
+    def _setup_mpc(self) -> None:
         self.mpc = do_mpc.controller.MPC(self._model)
 
         # Set MPC settings
@@ -513,9 +550,9 @@ class System:
         self.mpc.x0 = self._x0
         self.mpc.set_initial_guess()
 
-    def _tvp_fun(self, t_now):
+    def _tvp_fun(self, _t_now: float) -> dict:
         # Notes:
-        # - t_now ignored in favor of self._timestamp_us
+        # - _t_now ignored in favor of self._timestamp_us
         # - This function is called once during MPC setup (before the reference trajectory is set)
 
         DT_MPC_US = int(self.DT_MPC * 1e6)
@@ -572,12 +609,14 @@ class System:
         Args:
             request: The request containing the current state, planned trajectory, and future time.
         Returns:
-            A response containing the current pose in the local frame.
+            A response containing the current pose and dynamic state in the local frame.
         """
 
         logging.debug(
-            f"run_controller_and_vehicle_model: {request.session_uuid}: "
-            f"{request.state.timestamp_us} -> {request.future_time_us}"
+            "run_controller_and_vehicle_model: %s: %s -> %s",
+            request.session_uuid,
+            request.state.timestamp_us,
+            request.future_time_us,
         )
 
         # Input sanity checks
@@ -599,7 +638,9 @@ class System:
                 f"Timestamp mismatch: expected {self._trajectory.timestamps_us[-1]}, got {request.state.timestamp_us}"
             )
         logging.debug(
-            f"overriding pose at timestamp {request.state.timestamp_us} with {request.state.pose}"
+            "overriding pose at timestamp %s with %s",
+            request.state.timestamp_us,
+            request.state.pose,
         )
         self._trajectory.poses.vec3[-1] = trajectory.QVec.from_grpc_pose(
             request.state.pose
@@ -640,12 +681,65 @@ class System:
         current_pose_local_to_rig = self._trajectory.last_pose.to_grpc_pose_at_time(
             self._timestamp_us
         )
+
+        # Build dynamic state with velocities and accelerations in rig frame
+        dynamic_state = self._build_dynamic_state_in_rig_frame()
+
         return controller_pb2.RunControllerAndVehicleModelResponse(
             pose_local_to_rig=current_pose_local_to_rig,
             pose_local_to_rig_estimated=current_pose_local_to_rig,
+            dynamic_state=dynamic_state,
+            dynamic_state_estimated=dynamic_state,
         )
 
-    def _step(self, dt_us: int):
+    def _build_dynamic_state_in_rig_frame(self) -> common_pb2.DynamicState:
+        """
+        Builds the DynamicState message with velocities and accelerations
+        converted from CG frame to rig frame.
+
+        The rig frame is offset from the CG by l_rig_to_cg along the x-axis.
+        The transformation accounts for:
+        - Velocity: v_rig = v_cg + omega × r_cg_to_rig
+        - Acceleration: a_rig = a_cg + alpha × r_cg_to_rig + omega × (omega × r_cg_to_rig)
+
+        Where r_cg_to_rig = [-l_rig_to_cg, 0, 0] (CG is ahead of rig origin).
+        """
+        l_rig_to_cg = self._vehicle_model.parameters.l_rig_to_cg
+        state = self._vehicle_model.state
+        accels = self._vehicle_model.accelerations
+
+        # Extract CG-frame quantities
+        v_cg_x = state[3]  # Longitudinal velocity at CG
+        v_cg_y = state[4]  # Lateral velocity at CG
+        yaw_rate = state[5]  # Angular velocity (yaw rate)
+
+        a_cg_x = accels[0]  # Longitudinal acceleration at CG (= state[7])
+        a_cg_y = accels[1]  # Lateral acceleration at CG
+        d_yaw_rate = accels[2]  # Angular acceleration
+
+        # Convert velocity from CG to rig frame:
+        # v_rig = v_cg + omega × r_cg_to_rig
+        # omega × [-l, 0, 0] = [0, 0, yaw_rate] × [-l, 0, 0] = [0, -yaw_rate * l, 0]
+        v_rig_x = v_cg_x
+        v_rig_y = v_cg_y - yaw_rate * l_rig_to_cg
+
+        # Convert acceleration from CG to rig frame:
+        # a_rig = a_cg + alpha × r_cg_to_rig + omega × (omega × r_cg_to_rig)
+        # alpha × [-l, 0, 0] = [0, 0, d_yaw] × [-l, 0, 0] = [0, -d_yaw * l, 0]
+        # omega × (omega × r) = omega × [0, -yaw_rate * l, 0]
+        #                     = [0, 0, yaw_rate] × [0, -yaw_rate * l, 0]
+        #                     = [yaw_rate² * l, 0, 0]
+        a_rig_x = a_cg_x + yaw_rate * yaw_rate * l_rig_to_cg
+        a_rig_y = a_cg_y - d_yaw_rate * l_rig_to_cg
+
+        return common_pb2.DynamicState(
+            linear_velocity=common_pb2.Vec3(x=v_rig_x, y=v_rig_y, z=0.0),
+            angular_velocity=common_pb2.Vec3(x=0.0, y=0.0, z=yaw_rate),
+            linear_acceleration=common_pb2.Vec3(x=a_rig_x, y=a_rig_y, z=0.0),
+            angular_acceleration=common_pb2.Vec3(x=0.0, y=0.0, z=d_yaw_rate),
+        )
+
+    def _step(self, dt_us: int) -> None:
         # Reset the integrated positional states (x, y, psi)
         # This is equivalent to resetting the vehicle model to the origin so we can
         # compute the relative pose over the propagation time
@@ -663,16 +757,20 @@ class System:
         self._timestamp_us += dt_us
 
         logging.debug(
-            f"pose_rig_t0_to_rig_t1: {pose_rig_t0_to_rig_t1.vec3}, {pose_rig_t0_to_rig_t1.quat}"
+            "pose_rig_t0_to_rig_t1: %s, %s",
+            pose_rig_t0_to_rig_t1.vec3,
+            pose_rig_t0_to_rig_t1.quat,
         )
         self._trajectory.update_relative(self._timestamp_us, pose_rig_t0_to_rig_t1)
         logging.debug(
-            f"current pose local to rig: {self._trajectory.last_pose.vec3}, {self._trajectory.last_pose.quat}"
+            "current pose local to rig: %s, %s",
+            self._trajectory.last_pose.vec3,
+            self._trajectory.last_pose.quat,
         )
 
         self._log()
 
-    def _log_header(self):
+    def _log_header(self) -> None:
         self._log_file_handle.write("timestamp_us,")
         self._log_file_handle.write("x,y,z,")
         self._log_file_handle.write("qx,qy,qz,qw,")
@@ -685,7 +783,7 @@ class System:
         self._log_file_handle.write("x_ref_0,y_ref_0,")
         self._log_file_handle.write("yaw_ref_0\n")
 
-    def _log(self):
+    def _log(self) -> None:
         self._log_file_handle.write(f"{self._timestamp_us},")  # 0
         for i in range(3):
             self._log_file_handle.write(f"{self._trajectory.last_pose.vec3[i]},")  # 1-3

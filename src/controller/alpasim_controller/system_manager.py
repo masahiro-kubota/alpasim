@@ -32,7 +32,7 @@ class SystemManager:
     def run_controller_and_vehicle_model(
         self, request: controller_pb2.RunControllerAndVehicleModelRequest
     ):
-        logging.info(
+        logging.debug(
             f"run_controller_and_vehicle called for session_uuid: {request.session_uuid}"
         )
         if request.session_uuid not in self._systems:

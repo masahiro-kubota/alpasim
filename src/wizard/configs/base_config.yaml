@@ -22,6 +22,7 @@ defines:
   helper: scripts
   vscode: sources/remote-vscode-server
   nre_cache_size: 4
+  physics_cache_size: 16  # should match or exceed concurrent scenes to avoid cache thrashing
 
 # \/ the wizard.* section defines properties global to all alpasim modules
 wizard:
@@ -81,6 +82,9 @@ wizard:
 
   submitter: "unspecified" # An optional specifier of the submitter (used for tracking purposes)
   description: "unspecified" # An optional description of the run (used for tracking purposes)
+
+  # Global log level for all alpasim services (DEBUG, INFO, WARNING, ERROR)
+  log_level: INFO
 
 scenes:
   # `scene_ids` is defined in stable_manifest/oss.yaml
@@ -168,6 +172,8 @@ services:
       - "--port={port}" # arbitrary, needs to be updated in runtime-config.yaml
       - "--artifact-glob=/mnt/nre-data/{sceneset}/**/*.usdz"
       - "--use-ground-mesh=true"
+      - "--cache-size=${defines.physics_cache_size}"  # should match or exceed concurrent scenes to avoid cache thrashing
+      - "--log-level=${wizard.log_level}"
     replicas_per_container: 1
     gpus: [1]
 
@@ -187,6 +193,7 @@ services:
       - "uv run python -m alpasim_controller.server"
       - "--port={port}"
       - "--log_dir=/mnt/output"
+      - "--log-level=${wizard.log_level}"
     replicas_per_container: 1
     gpus: null
 
@@ -209,9 +216,10 @@ services:
     command:
       - "uv run python -m alpasim_runtime.simulate"
       - "--usdz-glob=/mnt/nre-data/{sceneset}/**/*.usdz"
-      - "--prometheus-out=/mnt/rollouts/alpasim-runtime.prom"
       - "--user-config=/mnt/rollouts/{runtime_config_name}"
       - "--network-config=/mnt/rollouts/generated-network-config.yaml"
+      - "--log-dir=/mnt/rollouts"
+      - "--log-level=${wizard.log_level}"
     replicas_per_container: 1 # should only be one runtime orchestrator
 
   eval:
@@ -229,6 +237,7 @@ services:
       - "--output_dir=/mnt/log_dir/eval"
       - "--trajdata_cache_dir=/mnt/trajdata_cache_dir"
       - "--usdz_glob=/mnt/nre-data/{sceneset}/**/*.usdz"
+      - "--log-level=${wizard.log_level}"
 
   post_eval_aggregation:
     image: ${services.eval.image}
@@ -244,6 +253,11 @@ services:
       - "--config_path=/mnt/log_dir/eval-config.yaml"
 
 runtime:
+  # Number of worker processes for parallel rollout execution.
+  # 1 = inline mode, all in one process, good for debugging
+  # >1 = multi-worker mode with subprocess-based parallelism
+  nr_workers: 1
+
   endpoints:
     sensorsim:
       # how many rollouts can run on a single worker at once
@@ -270,7 +284,6 @@ runtime:
     # Cache size used by the scene cache monitor to ensure enough capacity
     sensorsim_cache_size: ${defines.nre_cache_size}
 
-  save_dir: "/mnt/rollouts/asl" # this is tied to mount points in `docker-compose.yaml`
   enable_autoresume: false
 
   default_scenario_parameters:
@@ -365,9 +378,23 @@ eval:
   video:
     render_video: True
     camera_id_to_render: camera_front_wide_120fov
+    overlay_plans_on_camera: True
     render_every_nth_frame: 1
     generate_combined_video: False
     combined_video_speed_factor: 0.33
+    metrics_table_entries:
+      - offroad_or_collision_at_fault
+      - collision_any
+      - collision_at_fault
+      - collision_front
+      - collision_lateral
+      - collision_rear
+      - offroad
+      - dist_to_gt_trajectory
+      - dist_to_gt_location
+      - progress
+      - progress_rel
+      - safety_monitor_triggered
     map_video:
       map_radius_m: 20
       ego_loc: BOTTOM_CENTER

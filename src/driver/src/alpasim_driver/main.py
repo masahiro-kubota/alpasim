@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from importlib.metadata import version
 from io import BytesIO
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 import hydra
 import matplotlib.pyplot as plt
@@ -30,6 +30,7 @@ import torch.serialization
 from alpasim_grpc import API_VERSION_MESSAGE
 from alpasim_grpc.v0 import sensorsim_pb2
 from alpasim_grpc.v0.common_pb2 import (
+    DynamicState,
     Empty,
     Pose,
     PoseAtTime,
@@ -63,8 +64,16 @@ import grpc
 import grpc.aio
 
 from .frame_cache import FrameCache, FrameEntry
-from .rectification import FthetaToPinholeRectifier, build_rectifier_map
-from .schema import VAMDriverConfig
+from .rectification import (
+    FthetaToPinholeRectifier,
+    build_ftheta_rectifier_for_resolution,
+)
+from .schema import RectificationTargetConfig, VAMDriverConfig
+from .trajectory_optimizer import (
+    TrajectoryOptimizer,
+    VehicleConstraints,
+    add_heading_to_trajectory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +110,9 @@ def load_inference_VAM(
     config["action_checkpoint_path"] = None
     config["gpt_mup_base_shapes"] = None
     config["action_mup_base_shapes"] = None
+
+    logging.info("Loading VAM checkpoint from %s", checkpoint_path)
+    logging.info("VAM config: %s", config)
 
     vam = VideoActionModelInference(**config)
     state_dict = OrderedDict()
@@ -186,13 +198,16 @@ class Session:
     seed: int
     debug_scene_id: str
 
-    frame_cache: FrameCache
+    frame_caches: dict[str, FrameCache]
     available_cameras_logical_ids: set[str]
     desired_cameras_logical_ids: set[str]
+    camera_specs: dict[str, sensorsim_pb2.AvailableCamerasReturn.AvailableCamera]
+    rectification_cfg: Optional[dict[str, RectificationTargetConfig]] = None
     rectifiers: dict[str, Optional[FthetaToPinholeRectifier]] = field(
         default_factory=dict
     )
     poses: list[PoseAtTime] = field(default_factory=list)
+    dynamic_states: list[tuple[int, DynamicState]] = field(default_factory=list)
     current_command: DriveCommand = DriveCommand.STRAIGHT  # Default to straight
 
     @staticmethod
@@ -200,6 +215,7 @@ class Session:
         request: DriveSessionRequest,
         cfg: VAMDriverConfig,
         context_length: int,
+        subsample_factor: int = 1,
     ) -> Session:
         """Create a new VAM session."""
         debug_scene_id = (
@@ -223,49 +239,157 @@ class Session:
                 )
             available_cameras_logical_ids.add(camera_def.logical_id)
             camera_specs[camera_def.logical_id] = camera_def
+            logger.debug(
+                f"Available camera: {camera_def.logical_id}, "
+                f"resolution: ({camera_def.intrinsics.resolution_h}, {camera_def.intrinsics.resolution_w}), "
+                f"intrinsics: {camera_def.intrinsics}"
+            )
 
         desired_cameras_logical_ids = set(cfg.inference.use_cameras)
         if not desired_cameras_logical_ids:
             raise ValueError("No cameras specified in inference configuration")
-        if not len(desired_cameras_logical_ids) == 1:
-            raise ValueError("Only one camera is supported for now.")
 
-        rectifiers = build_rectifier_map(
-            cfg.rectification,
-            desired_cameras_logical_ids,
-            camera_specs,
-        )
+        # VAM model currently requires exactly one camera
+        if len(cfg.inference.use_cameras) != 1:
+            raise ValueError(
+                f"VAM model requires exactly one camera, got {len(cfg.inference.use_cameras)}: "
+                f"{cfg.inference.use_cameras}. Multi-camera support requires a different model."
+            )
+
+        missing_defs = desired_cameras_logical_ids - set(camera_specs.keys())
+        if missing_defs:
+            raise ValueError(
+                f"Requested cameras {sorted(missing_defs)} are missing from the rollout spec"
+            )
+        if cfg.rectification is not None:
+            missing_rect = desired_cameras_logical_ids - set(cfg.rectification.keys())
+            if missing_rect:
+                raise ValueError(
+                    "Missing rectification targets for cameras "
+                    f"{sorted(missing_rect)} in driver configuration"
+                )
+
+        rectifiers: dict[str, Optional[FthetaToPinholeRectifier]] = {
+            logical_id: None for logical_id in desired_cameras_logical_ids
+        }
+
+        # Create a FrameCache for each desired camera
+        frame_caches: dict[str, FrameCache] = {}
+        for camera_id in cfg.inference.use_cameras:
+            frame_caches[camera_id] = FrameCache(
+                context_length=context_length,
+                camera_id=camera_id,
+                subsample_factor=subsample_factor,
+            )
 
         session = Session(
             uuid=request.session_uuid,
             seed=request.random_seed,
             debug_scene_id=debug_scene_id,
-            frame_cache=FrameCache(context_length),
+            frame_caches=frame_caches,
             available_cameras_logical_ids=available_cameras_logical_ids,
             desired_cameras_logical_ids=desired_cameras_logical_ids,
+            camera_specs=camera_specs,
+            rectification_cfg=cfg.rectification,
             rectifiers=rectifiers,
         )
 
         return session
 
-    def add_image(self, image_tensor: np.ndarray, timestamp_us: int) -> None:
-        """Add an image observation."""
-        self.frame_cache.add_image(timestamp_us, image_tensor)
+    def add_image(
+        self, logical_id: str, image_tensor: np.ndarray, timestamp_us: int
+    ) -> None:
+        """Add an image observation for a specific camera."""
+        if logical_id not in self.frame_caches:
+            raise ValueError(
+                f"Camera {logical_id} not in desired cameras: {list(self.frame_caches.keys())}"
+            )
+        self.frame_caches[logical_id].add_image(timestamp_us, image_tensor)
+
+    def all_cameras_ready(self) -> bool:
+        """Check if all cameras have enough frames for inference."""
+        return all(cache.has_enough_frames() for cache in self.frame_caches.values())
+
+    def min_frame_count(self) -> int:
+        """Return the minimum frame count across all cameras."""
+        if not self.frame_caches:
+            return 0
+        return min(cache.frame_count() for cache in self.frame_caches.values())
+
+    def pending_frames_all_cameras(self) -> list[FrameEntry]:
+        """Return pending frames across all cameras."""
+        result = []
+        for cache in self.frame_caches.values():
+            result.extend(cache.pending_frames())
+        return result
+
+    def _maybe_build_rectifier(
+        self, logical_id: str, source_resolution_hw: tuple[int, int]
+    ) -> Optional[FthetaToPinholeRectifier]:
+        """Instantiate and cache a rectifier once the true source resolution is known."""
+
+        # Check if there's a rectifier for target camera in the config
+        if self.rectification_cfg is None or logical_id not in self.rectification_cfg:
+            return None
+
+        # Check if we already have a rectifier for this camera
+        if self.rectifiers.get(logical_id) is not None:
+            return self.rectifiers[logical_id]
+
+        # Build the rectifier
+        rectifier = build_ftheta_rectifier_for_resolution(
+            camera_proto=self.camera_specs[logical_id],
+            target_cfg=self.rectification_cfg[logical_id],
+            source_resolution_hw=source_resolution_hw,
+        )
+        self.rectifiers[logical_id] = rectifier
+        logger.debug(
+            "Built f-theta rectifier for %s using source resolution %s",
+            logical_id,
+            source_resolution_hw,
+        )
+        return rectifier
 
     def rectify_image(self, logical_id: str, image: Image.Image) -> Image.Image:
         """Apply rectification for logical_id if configured."""
-        rectifier = self.rectifiers.get(logical_id)
+        source_resolution_hw = (image.height, image.width)
+
+        # Need to do this lazily as we won't know the source resolution until
+        # after the first image is received.
+        # (The available cameras define the native camera resolutio, not the
+        # rendering resolution.)
+        rectifier = self._maybe_build_rectifier(logical_id, source_resolution_hw)
+
         if rectifier is None:
             return image
-        image_np = np.array(image)
-        rectified = rectifier.rectify(image_np)
-        return Image.fromarray(rectified)
+        return Image.fromarray(rectifier.rectify(np.array(image)))
 
     def add_egoposes(self, egoposes: Trajectory) -> None:
         """Add rig-est pose observations in the local frame."""
         self.poses.extend(egoposes.poses)
         self.poses = sorted(self.poses, key=lambda pose: pose.timestamp_us)
         logger.debug(f"poses: {self.poses}")
+
+    def add_dynamic_state(
+        self, timestamp_us: int, dynamic_state: Optional[DynamicState]
+    ) -> None:
+        """Add a dynamic state observation at the given timestamp.
+
+        Args:
+            timestamp_us: Timestamp in microseconds for this observation.
+            dynamic_state: The dynamic state (velocities, accelerations) in rig frame.
+                May be None if not provided by the client.
+        """
+        if dynamic_state is None:
+            return
+        self.dynamic_states.append((timestamp_us, dynamic_state))
+        self.dynamic_states = sorted(self.dynamic_states, key=lambda x: x[0])
+        logger.debug(
+            f"dynamic_state at {timestamp_us}: "
+            f"lin_vel=({dynamic_state.linear_velocity.x:.2f}, "
+            f"{dynamic_state.linear_velocity.y:.2f}, "
+            f"{dynamic_state.linear_velocity.z:.2f})"
+        )
 
     def update_command_from_route(
         self,
@@ -392,6 +516,39 @@ class VAMPolicyService(EgodriverServiceServicer):
         )
         self._context_length = self._cfg.inference.context_length
         self._sessions: dict[str, Session] = {}
+
+        # Initialize trajectory optimizer if enabled
+        self._trajectory_optimizer: Optional[TrajectoryOptimizer] = None
+        self._vehicle_constraints: Optional[VehicleConstraints] = None
+        if cfg.trajectory_optimizer.enabled:
+            opt_cfg = cfg.trajectory_optimizer
+            self._trajectory_optimizer = TrajectoryOptimizer(
+                smoothness_weight=opt_cfg.smoothness_weight,
+                deviation_weight=opt_cfg.deviation_weight,
+                comfort_weight=opt_cfg.comfort_weight,
+                max_iterations=opt_cfg.max_iterations,
+                enable_frenet_retiming=opt_cfg.retime_in_frenet,
+                retime_alpha=opt_cfg.retime_alpha,
+            )
+            self._vehicle_constraints = VehicleConstraints(
+                max_deviation=opt_cfg.max_deviation,
+                max_heading_change=opt_cfg.max_heading_change,
+                max_speed=opt_cfg.max_speed,
+                max_accel=opt_cfg.max_accel,
+                max_abs_yaw_rate=opt_cfg.max_abs_yaw_rate,
+                max_abs_yaw_acc=opt_cfg.max_abs_yaw_acc,
+                max_lon_acc_pos=opt_cfg.max_lon_acc_pos,
+                max_lon_acc_neg=opt_cfg.max_lon_acc_neg,
+                max_abs_lon_jerk=opt_cfg.max_abs_lon_jerk,
+            )
+
+            logger.info(
+                "Trajectory optimizer enabled with retiming=%s, alpha=%.2f",
+                opt_cfg.retime_in_frenet,
+                opt_cfg.retime_alpha,
+            )
+            logger.info(f"Trajectory optimizer config: {opt_cfg}")
+
         self._worker_thread.start()
 
     async def stop_worker(self) -> None:
@@ -405,6 +562,8 @@ class VAMPolicyService(EgodriverServiceServicer):
     def _worker_main(self) -> None:
         """Blocking worker loop that batches drive jobs for inference."""
         torch.set_grad_enabled(False)
+        batch_count = 0
+        total_items = 0
         while True:
             if self._worker_stop.is_set():
                 break
@@ -434,8 +593,17 @@ class VAMPolicyService(EgodriverServiceServicer):
                 batch.append(next_job)
 
             try:
-                logging.info("Running VAM batch of size %s", len(batch))
+                logger.debug("Running VAM batch of size %s", len(batch))
                 responses = self._run_batch(batch)
+                batch_count += 1
+                total_items += len(batch)
+                if batch_count % 100 == 0:
+                    logger.info(
+                        "VAM batches: %d processed, %d total items, avg size %.1f",
+                        batch_count,
+                        total_items,
+                        total_items / batch_count,
+                    )
             except Exception as exc:
                 logger.exception("VAM batch failed")
                 for pending_job in batch:
@@ -443,7 +611,7 @@ class VAMPolicyService(EgodriverServiceServicer):
                         pending_job.result.set_exception, exc
                     )
             else:
-                logging.info("VAM batch succeeded")
+                logger.debug("VAM batch succeeded")
                 for pending_job, response in zip(batch, responses, strict=True):
                     self._loop.call_soon_threadsafe(
                         pending_job.result.set_result, response
@@ -464,28 +632,19 @@ class VAMPolicyService(EgodriverServiceServicer):
             self._loop.call_soon_threadsafe(leftover.result.cancel)
 
     def _tokenize_frames(self, batch: list[DriveJob]) -> None:
-        """Tokenize frames for the given batch."""
-        frame_entries_to_tokenize: list[tuple[DriveJob, FrameEntry]] = []
+        """Tokenize frames for all cameras in the given batch."""
+        frames_to_tokenize: list[FrameEntry] = []
 
-        # Which frames are still pending tokenization?
+        # Collect pending frames from all cameras across all jobs
         for job in batch:
-            frame_entries_to_tokenize.extend(
-                (job, frame_entry)
-                for frame_entry in job.session.frame_cache.pending_frames()
-            )
+            frames_to_tokenize.extend(job.session.pending_frames_all_cameras())
 
-        if frame_entries_to_tokenize:
-            # Extract out the images and tokenize them.
-            images: list[np.ndarray] = []
-            owners: list[tuple[DriveJob, FrameEntry]] = []
-            for job, frame in frame_entries_to_tokenize:
-                images.append(frame.image)
-                owners.append((job, frame))
-
+        if frames_to_tokenize:
+            images = [frame.image for frame in frames_to_tokenize]
             token_batches = self._tokenize_batch(images)
 
-            # Add the tokens to the frame cache.
-            for (_, frame), tokens in zip(owners, token_batches, strict=True):
+            # Assign tokens back to frame entries
+            for frame, tokens in zip(frames_to_tokenize, token_batches, strict=True):
                 frame.tokens = tokens
 
     def _tokenize_batch(self, images: list[np.ndarray]) -> list[torch.Tensor]:
@@ -504,120 +663,48 @@ class VAMPolicyService(EgodriverServiceServicer):
                 token_batch = self._image_tokenizer(batch)
         return [tokens.detach().cpu() for tokens in token_batch]
 
-    def _maybe_plot_batch_results(
+    def _maybe_save_rectification_debug_image(
         self,
-        batch: list[DriveJob],
-        context_images: list[list[np.ndarray | None]],
-        vam_trajectories: list[np.ndarray],
-        alpasim_trajectories: list[Trajectory],
-        timestamps: list[int],
-        commands: list[DriveCommand],
+        pre_image: Image.Image,
+        post_image: Image.Image,
+        scene_id: str,
+        logical_id: str,
+        timestamp_us: int,
     ) -> None:
-        """Plot all context images and trajectories for debugging."""
+        """Save pre- and post-rectification images side by side for
+        debugging."""
+
         if not self._cfg.plot_debug_images:
             return
 
         if not self._cfg.output_dir:
-            msg = "Output directory is not set but we want to plot output"
-            raise ValueError(msg)
+            logger.warning("Output directory is not set; skipping rectification dump")
+            return
 
-        # Plot and save one file per job
-        for i, (job, imgs, vam_traj, alpasim_traj, ts, cmd) in enumerate(
-            zip(
-                batch,
-                context_images,
-                vam_trajectories,
-                alpasim_trajectories,
-                timestamps,
-                commands,
-                strict=True,
-            )
-        ):
-            context_length = len(imgs)
+        session_folder = os.path.join(
+            self._cfg.output_dir, scene_id, "rectification_debug"
+        )
+        os.makedirs(session_folder, exist_ok=True)
 
-            # Get timestamps for all frames in context
-            frame_timestamps = [
-                entry.timestamp_us for entry in job.session.frame_cache.entries
-            ]
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-            # Create figure: one row with all context frames + trajectory
-            # Layout: 1 row, (context_length + 1) columns
-            # [context_frame_0, ..., context_frame_N-1, trajectory]
-            plt.figure(figsize=(3 * (context_length + 1), 4))
+        axes[0].imshow(np.array(pre_image))
+        axes[0].set_title(f"Pre-rectification ({pre_image.width}x{pre_image.height})")
+        axes[0].axis("off")
 
-            # Plot all context frames for this job
-            for j in range(context_length):
-                subplot_idx = j + 1
-                ax_img = plt.subplot(1, context_length + 1, subplot_idx)
-                if imgs[j] is not None:
-                    ax_img.imshow(imgs[j])
+        axes[1].imshow(np.array(post_image))
+        axes[1].set_title(
+            f"Post-rectification ({post_image.width}x{post_image.height})"
+        )
+        axes[1].axis("off")
 
-                # Add timestamp to each frame
-                frame_ts = frame_timestamps[j] / 1e6  # Convert to seconds
-                if j == context_length - 1:
-                    # Latest frame: show timestamp and command
-                    ax_img.set_title(
-                        f"t={frame_ts:.3f}s\ncmd={cmd.name}",
-                        fontsize=9,
-                    )
-                else:
-                    # Older frames: show timestamp
-                    ax_img.set_title(f"t={frame_ts:.3f}s", fontsize=9)
-                ax_img.axis("off")
+        fig.suptitle(f"{logical_id} @ {timestamp_us} µs")
+        fig.tight_layout()
 
-            # Plot trajectories in the last column
-            ax_traj = plt.subplot(1, context_length + 1, context_length + 1)
-
-            # Plot VAM trajectory (raw model output)
-            ax_traj.plot(
-                vam_traj[:, 0],
-                vam_traj[:, 1],
-                "b-o",
-                label="VAM output",
-                markersize=4,
-            )
-
-            # Plot Alpasim trajectory (converted to world frame)
-            if len(alpasim_traj.poses) > 0:
-                alpasim_x = [pose.pose.vec.x for pose in alpasim_traj.poses]
-                alpasim_y = [pose.pose.vec.y for pose in alpasim_traj.poses]
-                ax_traj.plot(
-                    alpasim_x,
-                    alpasim_y,
-                    "r-s",
-                    label="Alpasim trajectory",
-                    markersize=4,
-                )
-
-            ax_traj.set_xlabel("X (m)", fontsize=8)
-            ax_traj.set_ylabel("Y (m)", fontsize=8)
-            ax_traj.set_title("Trajectory", fontsize=9)
-            ax_traj.legend(fontsize=7)
-            ax_traj.grid(True, alpha=0.3)
-            ax_traj.axis("equal")
-
-            plt.tight_layout()
-
-            # Create session-specific subfolder
-            session_folder = os.path.join(
-                self._cfg.output_dir, job.session.debug_scene_id
-            )
-            os.makedirs(session_folder, exist_ok=True)
-
-            # Save file per job with timestamp
-            output_path = os.path.join(session_folder, f"vam_debug_{ts}.png")
-            plt.savefig(output_path, dpi=100)
-            plt.close()
-
-            # Print timestamp and command info
-            logger.info(
-                "Job[%s]: timestamp=%.3fs, command=%s (%s), saved to %s",
-                i,
-                ts / 1e6,
-                cmd.name,
-                int(cmd),
-                output_path,
-            )
+        filename = f"{timestamp_us}_{logical_id}_rectification.png"
+        output_path = os.path.join(session_folder, filename)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
 
     def _run_batch(self, batch: list[DriveJob]) -> list[DriveResponse]:
         self._tokenize_frames(batch)
@@ -625,20 +712,23 @@ class VAMPolicyService(EgodriverServiceServicer):
         inputs: list[torch.Tensor] = []
         commands: list[DriveCommand] = []
         timestamps: list[int] = []
-        context_images: list[list[np.ndarray | None]] = []
 
         for job in batch:
-            token_window = job.session.frame_cache.latest_token_window()
-            tensor = torch.stack(token_window, dim=0)  # (T, C, H, W)
+            # Collect tokens from all cameras (VAM validates single camera at session creation)
+            camera_tokens = []
+            for frame_cache in job.session.frame_caches.values():
+                token_window = frame_cache.latest_token_window()
+                camera_tokens.append(torch.stack(token_window, dim=0))  # (T, C, H, W)
+
+            # # Concatenate along channel dimension: (T, N*C, H, W)
+            # tensor = torch.cat(camera_tokens, dim=1)
+            # For now assume a single camera
+            if len(camera_tokens) != 1:
+                raise ValueError(f"Expected 1 camera token, got {len(camera_tokens)}")
+            tensor = camera_tokens[0]  # NOTE: Remove when we want more cameras!
             inputs.append(tensor)
             commands.append(job.command)
             timestamps.append(job.timestamp_us)
-
-            # Get all images and timestamps in the context window
-            images_in_context = [
-                entry.image for entry in job.session.frame_cache.entries
-            ]
-            context_images.append(images_in_context)
 
         visual_tokens = torch.stack(inputs, dim=0).to(self._device)  # (B, T, C, H, W)
         command_tensor = torch.tensor(  # (B, 1)
@@ -673,16 +763,6 @@ class VAMPolicyService(EgodriverServiceServicer):
             vam_trajectories.append(np_traj)
             alpasim_trajectories.append(alpasim_traj)
 
-        # Plot batch results for debugging
-        self._maybe_plot_batch_results(
-            batch,
-            context_images,
-            vam_trajectories,
-            alpasim_trajectories,
-            timestamps,
-            commands,
-        )
-
         return responses
 
     @async_log_call
@@ -697,7 +777,12 @@ class VAMPolicyService(EgodriverServiceServicer):
             return SessionRequestStatus()
 
         logger.info(f"Starting VAM session {request.session_uuid}")
-        session = Session.create(request, self._cfg, self._context_length)
+        session = Session.create(
+            request,
+            self._cfg,
+            self._context_length,
+            subsample_factor=self._cfg.inference.subsample_factor,
+        )
         self._sessions[request.session_uuid] = session
 
         return SessionRequestStatus()
@@ -753,9 +838,20 @@ class VAMPolicyService(EgodriverServiceServicer):
         if grpc_image.logical_id not in session.desired_cameras_logical_ids:
             raise ValueError(f"Camera {grpc_image.logical_id} not in desired cameras")
 
-        image = session.rectify_image(grpc_image.logical_id, image)
-        image = self._resize_and_crop_image(image)
-        session.add_image(np.array(image), grpc_image.frame_end_us)
+        rectified_image = session.rectify_image(grpc_image.logical_id, image)
+        self._maybe_save_rectification_debug_image(
+            image,
+            rectified_image,
+            session.debug_scene_id,
+            grpc_image.logical_id,
+            grpc_image.frame_end_us,
+        )
+        resized_rectified_image = self._resize_and_crop_image(rectified_image)
+        session.add_image(
+            grpc_image.logical_id,
+            np.array(resized_rectified_image),
+            grpc_image.frame_end_us,
+        )
 
         return Empty()
 
@@ -763,7 +859,29 @@ class VAMPolicyService(EgodriverServiceServicer):
     async def submit_egomotion_observation(
         self, request: RolloutEgoTrajectory, context: grpc.aio.ServicerContext
     ) -> Empty:
-        self._sessions[request.session_uuid].add_egoposes(request.trajectory)
+        session = self._sessions[request.session_uuid]
+
+        # Guard: We currently assume a single pose per egomotion observation.
+        # The dynamic_state has no timestamp and is assumed to correspond to
+        # the (single) pose's timestamp. If multiple poses are sent, remove
+        # this check and ensure proper handling of multi-pose trajectories.
+        if len(request.trajectory.poses) != 1:
+            raise ValueError(
+                f"Expected exactly 1 pose in egomotion trajectory, got {len(request.trajectory.poses)}. "
+                "The driver assumes dynamic_state corresponds to the single pose's timestamp. "
+                "If multi-pose trajectories are intentional, update the driver to handle them correctly."
+            )
+
+        session.add_egoposes(request.trajectory)
+
+        # Track dynamic state if provided (velocities, accelerations in rig frame)
+        if request.HasField("dynamic_state") and request.trajectory.poses:
+            # Use the latest pose timestamp for the dynamic state
+            latest_timestamp_us = max(
+                pose.timestamp_us for pose in request.trajectory.poses
+            )
+            session.add_dynamic_state(latest_timestamp_us, request.dynamic_state)
+
         return Empty()
 
     @async_log_call
@@ -793,6 +911,11 @@ class VAMPolicyService(EgodriverServiceServicer):
         return Empty()
 
     @async_log_call
+    def _check_frames_ready(self, session: Session) -> bool:
+        """Check if all cameras have enough frames for inference."""
+        return session.all_cameras_ready()
+
+    @async_log_call
     async def drive(
         self, request: DriveRequest, context: grpc.aio.ServicerContext
     ) -> DriveResponse:
@@ -801,14 +924,20 @@ class VAMPolicyService(EgodriverServiceServicer):
 
         session = self._sessions[request.session_uuid]
 
-        if session.frame_cache.frame_count() < self._context_length:
+        if not self._check_frames_ready(session):
             empty_traj = Trajectory()
-            logger.info(
+            # Get required frame count from first cache (all have same config)
+            min_required = next(
+                iter(session.frame_caches.values())
+            ).min_frames_required()
+            logger.debug(
                 "Drive request received with insufficient frames: "
-                "got %s frames, need at least %s frames. "
-                "Returning empty trajectory",
-                session.frame_cache.frame_count(),
+                "got %s min frames across cameras, need at least %s frames "
+                "(context_length=%s, subsample_factor=%s). Returning empty trajectory",
+                session.min_frame_count(),
+                min_required,
                 self._context_length,
+                self._cfg.inference.subsample_factor,
             )
             return DriveResponse(
                 trajectory=empty_traj,
@@ -818,7 +947,7 @@ class VAMPolicyService(EgodriverServiceServicer):
         logger.debug(f"pose_snapshot: {pose_snapshot}")
         if pose_snapshot is None:
             empty_traj = Trajectory()
-            logger.info(
+            logger.debug(
                 "Drive request received with no pose snapshot available "
                 "(poses list length: %s). Returning empty trajectory",
                 len(session.poses),
@@ -843,33 +972,66 @@ class VAMPolicyService(EgodriverServiceServicer):
         debug_data = {
             "command": int(session.current_command),
             "command_name": session.current_command.name,
-            "num_frames": session.frame_cache.frame_count(),
+            "num_frames": {
+                cam_id: cache.frame_count()
+                for cam_id, cache in session.frame_caches.items()
+            },
+            "num_cameras": len(session.frame_caches),
             "num_poses": len(session.poses),
             "trajectory_points": len(response.trajectory.poses),
         }
         response.debug_info.unstructured_debug_info = pickle.dumps(debug_data)
 
-        logging.info("Returning drive response at time %s", request.time_now_us)
+        logger.debug("Returning drive response at time %s", request.time_now_us)
         return response
 
     def _convert_vam_trajectory_to_alpasim(
         self,
-        vam_trajectory: np.ndarray,  # Shape: (6, 2) at 2Hz
+        vam_trajectory: np.ndarray,  # Shape: (N, 2) - x,y offsets in rig frame
         current_pose: PoseAtTime,
         time_now_us: int,
     ) -> Trajectory:
         trajectory = Trajectory()
-
         trajectory.poses.append(current_pose)
 
+        if vam_trajectory is None or len(vam_trajectory) == 0:
+            return trajectory
+
         curr_z = current_pose.pose.vec.z
-
         frequency_hz = self._cfg.trajectory.frequency_hz
-        # Convert trajectory output frequency (Hz) to microsecond spacing between poses.
         time_delta_us = int(1_000_000 / frequency_hz)
+        time_step = 1.0 / frequency_hz
 
+        # Apply trajectory optimization in rig frame if enabled
+        optimized_vam_trajectory = vam_trajectory
+        if self._trajectory_optimizer is not None and len(vam_trajectory) >= 2:
+            # Add heading to create [N, 3] trajectory for optimizer
+            rig_trajectory = add_heading_to_trajectory(vam_trajectory)
+
+            # Run optimization
+            opt_cfg = self._cfg.trajectory_optimizer
+            result = self._trajectory_optimizer.optimize(
+                trajectory=rig_trajectory,
+                time_step=time_step,
+                vehicle_constraints=self._vehicle_constraints,
+                retime_in_frenet=opt_cfg.retime_in_frenet,
+                retime_alpha=opt_cfg.retime_alpha,
+            )
+
+            if result.success:
+                # Extract x,y from optimized trajectory
+                optimized_vam_trajectory = result.trajectory[:, :2]
+                logger.debug(
+                    "Trajectory optimization succeeded: iterations=%s, cost=%.4f",
+                    result.iterations,
+                    result.final_cost,
+                )
+            else:
+                logger.warning("Trajectory optimization failed: %s", result.message)
+
+        # Convert rig offsets to local frame positions
         local_positions = _rig_est_offsets_to_local_positions(
-            current_pose, vam_trajectory
+            current_pose, optimized_vam_trajectory
         )
         num_positions = local_positions.shape[0]
 
@@ -981,9 +1143,13 @@ async def serve(cfg: VAMDriverConfig) -> None:
     config_name="vam_driver",
 )
 def main(cfg: VAMDriverConfig) -> None:
+    schema = OmegaConf.structured(VAMDriverConfig)
+    cfg: VAMDriverConfig = cast(VAMDriverConfig, OmegaConf.merge(schema, cfg))
+
     logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=getattr(logging, cfg.log_level.upper(), logging.INFO),
+        format="%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s",
+        datefmt="%H:%M:%S",
     )
 
     if cfg.output_dir:

@@ -14,7 +14,6 @@ endpoints:
   trafficsim:
     n_concurrent_rollouts: 14
     skip: false
-save_dir: /mnt/rollouts/asl
 scenarios:
   - assert_zero_decision_delay: true
     cameras:

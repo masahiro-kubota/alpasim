@@ -6,7 +6,7 @@ import io
 import logging
 import pickle
 from enum import StrEnum
-from typing import Any, Literal, Optional
+from typing import Any, Iterable, Literal, Optional
 
 import matplotlib.image as mpimg
 import matplotlib.transforms as transforms
@@ -15,6 +15,7 @@ import shapely
 from alpasim_grpc.v0.common_pb2 import AABB, Vec3
 from alpasim_grpc.v0.egodriver_pb2 import DriveResponse, RolloutCameraImage, Route
 from alpasim_grpc.v0.logging_pb2 import RolloutMetadata
+from alpasim_grpc.v0.sensorsim_pb2 import AvailableCamerasReturn, CameraSpec
 from alpasim_utils.qvec import QVec
 from alpasim_utils.trajectory import Trajectory
 from matplotlib import pyplot as plt
@@ -312,6 +313,8 @@ class DriverResponseAtTime:
     sampled_trajectories: list[RenderableTrajectory]
     # Safety monitor safe (not triggered) status.
     safety_monitor_safe: Optional[bool] = None
+    # Command name from driver debug info (e.g. "LEFT", "RIGHT", "STRAIGHT").
+    command_name: Optional[str] = None
 
     @staticmethod
     def _extract_debug_extra(driver_response: DriveResponse) -> dict | None:
@@ -413,9 +416,13 @@ class DriverResponseAtTime:
     ) -> "DriverResponseAtTime":
         """Helper function. Create DriverResponseAtTime from DriveResponse."""
         safety_monitor_safe = None
+        command_name = None
         extra = DriverResponseAtTime._extract_debug_extra(driver_response)
-        if extra is not None and "safe_trajectory" in extra:
-            safety_monitor_safe = extra["safe_trajectory"]
+        if extra is not None:
+            if "safe_trajectory" in extra:
+                safety_monitor_safe = extra["safe_trajectory"]
+            if "command_name" in extra:
+                command_name = extra["command_name"]
 
         # Selected trajectory
         selected_traj = RenderableTrajectory.from_grpc_with_aabb(
@@ -448,6 +455,7 @@ class DriverResponseAtTime:
             selected_trajectory=selected_traj,
             sampled_trajectories=sampled_trajs,
             safety_monitor_safe=safety_monitor_safe,
+            command_name=command_name,
         )
 
 
@@ -456,10 +464,9 @@ class DriverResponses:
     """Represents driver responses for all timesteps.
 
     Elements:
-        * `ego_aabb`: AABB of EGO. Used only when creating
-            `DriverResponseAtTime`s.
         * `ego_coords_rig_to_aabb_center`: Rig frame coordinates of AABB center.
-            Also only used when creating `DriverResponseAtTime`s.
+            Used when creating `DriverResponseAtTime`s.
+        * `ego_trajectory_local`: Ego trajectory in local frame, including RAABB.
         * `timestamps_us`: List of timestamps when the response was predicted.
         * `query_times_us`: List of timestamps for which the response was
             predicted.
@@ -468,14 +475,23 @@ class DriverResponses:
             repeatedly updated to capture the new driver response.
     """
 
-    ego_raabb: RAABB
     ego_coords_rig_to_aabb_center: QVec
+    ego_trajectory_local: RenderableTrajectory
+
+    @property
+    def ego_raabb(self) -> RAABB:
+        """RAABB of EGO, derived from ego_trajectory_local."""
+        return self.ego_trajectory_local.raabb
+
     timestamps_us: list[int] = dataclasses.field(default_factory=list)
     query_times_us: list[int] = dataclasses.field(default_factory=list)
     per_timestep_driver_responses: list[DriverResponseAtTime] = dataclasses.field(
         default_factory=list
     )
     artists: dict[str, list[plt.Artist]] | None = None
+    camera_artists_by_ax: dict[int, dict[str, list[plt.Artist] | plt.Artist | None]] = (
+        dataclasses.field(default_factory=dict)
+    )
 
     def add_drive_response(
         self, driver_response: DriveResponse, now_time_us: int, query_time_us: int
@@ -564,6 +580,120 @@ class DriverResponses:
 
         self.artists = current_artists
         return self.artists
+
+    def render_on_camera(
+        self,
+        ax: plt.Axes,
+        projector: "CameraProjector",
+        time: int,
+        which_time: Literal["now", "query"] = "now",
+    ) -> list[plt.Artist]:
+        """Render planner trajectories onto a camera axis."""
+        driver_response_at_time = self.get_driver_response_for_time(
+            time, which_time=which_time
+        )
+        artists = self.camera_artists_by_ax.setdefault(
+            id(ax), {"selected": None, "sampled": []}
+        )
+
+        overlay_artists: list[plt.Artist] = []
+
+        def _to_rig(traj: RenderableTrajectory) -> RenderableTrajectory:
+            """Convert stored AABB-frame trajectory back to the current rig frame."""
+            # Stored responses are local->aabb; undo the aabb offset to get local->rig.
+            traj_rig = traj.transform(
+                self.ego_coords_rig_to_aabb_center.inverse(), is_relative=True
+            )
+            # Ego pose is logged as local->aabb; convert to local->rig, then express
+            # the planned points in the ego rig frame by left-multiplying its inverse.
+            ego_pose_local_aabb = self.ego_trajectory_local.interpolate_pose(time)
+            ego_pose_local_rig = (
+                ego_pose_local_aabb @ self.ego_coords_rig_to_aabb_center.inverse()
+            )
+            rig_traj = traj_rig.transform(
+                ego_pose_local_rig.inverse(), is_relative=False
+            )
+            rig_traj.renderable_linestring = traj.renderable_linestring
+            return rig_traj
+
+        def _upsert_line(
+            artist: plt.Artist | None,
+            pixels: np.ndarray,
+            color: str,
+            linewidth: float,
+            alpha: float,
+        ) -> plt.Artist | None:
+            if pixels.shape[0] < 2:
+                if artist is not None:
+                    artist.set_data([], [])
+                    artist.set_alpha(0.0)
+                return artist
+            if artist is None:
+                artist = ax.plot(
+                    pixels[:, 0],
+                    pixels[:, 1],
+                    "-",
+                    color=color,
+                    linewidth=linewidth,
+                    alpha=alpha,
+                )[0]
+            else:
+                artist.set_data(pixels[:, 0], pixels[:, 1])
+                artist.set_color(color)
+                artist.set_linewidth(linewidth)
+                artist.set_alpha(alpha)
+            return artist
+
+        if driver_response_at_time is None:
+            if artists["selected"] is not None:
+                artists["selected"].set_data([], [])
+                artists["selected"].set_alpha(0.0)
+                overlay_artists.append(artists["selected"])
+            for art in artists["sampled"]:
+                art.set_data([], [])
+                art.set_alpha(0.0)
+                overlay_artists.append(art)
+            return overlay_artists
+
+        sel_ls = driver_response_at_time.selected_trajectory.renderable_linestring
+        sel_rig = _to_rig(driver_response_at_time.selected_trajectory)
+        sel_pixels, _ = projector.project_points(sel_rig.poses.vec3[:, :3])
+        artists["selected"] = _upsert_line(
+            artists["selected"],
+            sel_pixels,
+            sel_ls.color,
+            sel_ls.linewidth,
+            sel_ls.alpha,
+        )
+        if artists["selected"] is not None:
+            overlay_artists.append(artists["selected"])
+
+        needed = len(driver_response_at_time.sampled_trajectories)
+        while len(artists["sampled"]) < needed:
+            artists["sampled"].append(ax.plot([], [], "-")[0])
+        while len(artists["sampled"]) > needed:
+            extra = artists["sampled"].pop()
+            extra.remove()
+
+        for traj, artist in zip(
+            driver_response_at_time.sampled_trajectories,
+            artists["sampled"],
+            strict=True,
+        ):
+            ls = traj.renderable_linestring
+            rig_traj = _to_rig(traj)
+            pixels, _ = projector.project_points(rig_traj.poses.vec3[:, :3])
+            updated = _upsert_line(
+                artist,
+                pixels,
+                ls.color,
+                ls.linewidth,
+                ls.alpha,
+            )
+            if updated is not None:
+                overlay_artists.append(updated)
+
+        return overlay_artists
 
     def get_driver_response_for_time(
         self, time: int, which_time: Literal["now", "query"] = "now"
@@ -901,6 +1031,227 @@ class ActorPolygons:
 
 
 @dataclasses.dataclass
+class CameraCalibration:
+    """Calibration info for a camera."""
+
+    logical_id: str
+    intrinsics: CameraSpec
+    rig_to_camera: QVec
+
+    @staticmethod
+    def from_available_camera(
+        available_camera: AvailableCamerasReturn.AvailableCamera,
+    ) -> "CameraCalibration":
+        """Create calibration from an AvailableCamera proto."""
+        intrinsics = CameraSpec()
+        intrinsics.CopyFrom(available_camera.intrinsics)
+        return CameraCalibration(
+            logical_id=available_camera.logical_id,
+            intrinsics=intrinsics,
+            rig_to_camera=QVec.from_grpc_pose(available_camera.rig_to_camera),
+        )
+
+
+MIN_DEPTH_M = 1e-3
+
+
+@dataclasses.dataclass
+class CameraProjector:
+    """Projects rig-frame 3D points to pixel coordinates using camera calibration."""
+
+    calibration: CameraCalibration
+    actual_resolution: tuple[int, int] | None = None
+    _param_kind: str = dataclasses.field(init=False)
+
+    def __post_init__(self) -> None:
+        self._param_kind = self.calibration.intrinsics.WhichOneof("camera_param")
+        # In logs, rig_to_camera is effectively camera->rig; use inverse only.
+        self._rig_to_cam = self.calibration.rig_to_camera.as_se3()  # (4,4)
+        self._cam_to_rig = np.linalg.inv(self._rig_to_cam)
+        if self._param_kind in ["opencv_pinhole_param", "opencv_fisheye_param"]:
+            self._init_pinhole_like()
+        elif self._param_kind == "ftheta_param":
+            self._init_ftheta()
+        else:
+            raise ValueError(
+                f"Camera model {self._param_kind} not supported for projection "
+                f"(camera {self.calibration.logical_id})"
+            )
+        self._maybe_scale_intrinsics()
+
+    def _init_pinhole_like(self) -> None:
+        """Initialize pinhole / fisheye parameters (distortion ignored)."""
+        if self._param_kind == "opencv_fisheye_param":
+            logger.warning(
+                "Using pinhole approximation for camera %s; distortion ignored",
+                self.calibration.logical_id,
+            )
+        param = self.calibration.intrinsics.opencv_pinhole_param
+        self.fx = param.focal_length_x
+        self.fy = param.focal_length_y
+        self.cx = param.principal_point_x
+        self.cy = param.principal_point_y
+        self.img_w = int(self.calibration.intrinsics.resolution_w)
+        self.img_h = int(self.calibration.intrinsics.resolution_h)
+
+    def _init_ftheta(self) -> None:
+        """Initialize f-theta projection parameters."""
+        intr = self.calibration.intrinsics.ftheta_param
+        self._angle_to_pix = np.asarray(intr.angle_to_pixeldist_poly, dtype=float)
+        if self._angle_to_pix.size == 0:
+            raise ValueError(
+                f"F-theta calibration missing angle_to_pixeldist_poly "
+                f"(camera {self.calibration.logical_id})"
+            )
+        self._pix_to_angle = np.asarray(intr.pixeldist_to_angle_poly, dtype=float)
+        self._ftheta_cx = intr.principal_point_x
+        self._ftheta_cy = intr.principal_point_y
+        self._ftheta_max_angle = intr.max_angle if intr.max_angle > 0 else None
+        if intr.HasField("linear_cde"):
+            linear_c = intr.linear_cde.linear_c
+            linear_d = intr.linear_cde.linear_d
+            linear_e = intr.linear_cde.linear_e
+        else:
+            linear_c, linear_d, linear_e = 1.0, 0.0, 0.0
+        self._ftheta_linear_matrix = np.array(
+            [[linear_c, linear_d], [linear_e, 1.0]], dtype=float
+        )
+        self.img_w = int(self.calibration.intrinsics.resolution_w)
+        self.img_h = int(self.calibration.intrinsics.resolution_h)
+
+    def _maybe_scale_intrinsics(self) -> None:
+        """Adjust intrinsics if actual image resolution differs from calibration."""
+        if self.actual_resolution is None:
+            return
+        actual_w, actual_h = self.actual_resolution
+        if actual_w == self.img_w and actual_h == self.img_h:
+            return
+        sx = actual_w / self.img_w
+        sy = actual_h / self.img_h
+        if self._param_kind in ["opencv_pinhole_param", "opencv_fisheye_param"]:
+            self.fx *= sx
+            self.fy *= sy
+            self.cx *= sx
+            self.cy *= sy
+            self.img_w = int(actual_w)
+            self.img_h = int(actual_h)
+        elif self._param_kind == "ftheta_param":
+            self._ftheta_cx *= sx
+            self._ftheta_cy *= sy
+            scale = (sx + sy) * 0.5
+            self._angle_to_pix *= scale
+            self.img_w = int(actual_w)
+            self.img_h = int(actual_h)
+
+    def _rig_to_camera(
+        self, points_rig: np.ndarray, transform: np.ndarray
+    ) -> np.ndarray:
+        """Transform rig-frame points (N,3) to camera frame."""
+        rot = transform[:3, :3]
+        trans = transform[:3, 3]
+        return (rot @ points_rig.T).T + trans
+
+    def project_points(self, points_rig: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Project rig-frame points to pixel coords.
+
+        Returns:
+            pixels: (M, 2) array of valid pixel coordinates.
+            mask: boolean mask of length N indicating which input points are valid.
+        """
+        if points_rig.size == 0:
+            return np.empty((0, 2)), np.zeros((0,), dtype=bool)
+
+        pixels_pref, mask_pref = self._project_points_with_transform(
+            points_rig, self._cam_to_rig
+        )
+        return pixels_pref, mask_pref
+
+    def _project_points_with_transform(
+        self, points_rig: np.ndarray, transform: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if self._param_kind == "ftheta_param":
+            return self._project_points_ftheta(points_rig, transform)
+        return self._project_points_pinhole(points_rig, transform)
+
+    def _project_points_pinhole(
+        self,
+        points_rig: np.ndarray,
+        transform: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        pts_cam = self._rig_to_camera(points_rig, transform)
+        x, y, z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
+        valid = z > MIN_DEPTH_M
+        if not np.any(valid):
+            return np.empty((0, 2)), valid
+
+        xu = x[valid] / z[valid]
+        yu = y[valid] / z[valid]
+        u = self.fx * xu + self.cx
+        v = self.fy * yu + self.cy
+
+        in_frame = (u >= 0) & (u < self.img_w) & (v >= 0) & (v < self.img_h)
+        # Keep all points; axis limits will clip. Only depth/FOV filter applied.
+        in_frame[:] = True
+
+        mask = np.zeros_like(valid)
+        mask_indices = np.flatnonzero(valid)
+        mask[mask_indices[in_frame]] = True
+
+        pixels = np.stack([u[in_frame], v[in_frame]], axis=-1)
+        return pixels, mask
+
+    def _project_points_ftheta(
+        self,
+        points_rig: np.ndarray,
+        transform: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Project using f-theta theta→radius polynomial."""
+        pts_cam = self._rig_to_camera(points_rig, transform)
+        x, y, z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
+        xy_norm = np.hypot(x, y)
+
+        theta = np.zeros_like(xy_norm)
+        positive_z = z > MIN_DEPTH_M
+        theta[positive_z] = np.arctan2(xy_norm[positive_z], z[positive_z])
+
+        if self._ftheta_max_angle is not None:
+            within_fov = theta <= self._ftheta_max_angle + 1e-6
+        else:
+            within_fov = positive_z
+
+        radii = np.polynomial.polynomial.polyval(theta, self._angle_to_pix)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            scales = np.divide(
+                radii, xy_norm, out=np.zeros_like(radii), where=xy_norm > 1e-9
+            )
+
+        offsets = np.stack([x, y], axis=-1) * scales[:, None]
+        pixel_offsets = offsets @ self._ftheta_linear_matrix.T
+        u = pixel_offsets[:, 0] + self._ftheta_cx
+        v = pixel_offsets[:, 1] + self._ftheta_cy
+
+        in_frame = np.ones_like(u, dtype=bool)
+
+        valid = positive_z & within_fov & in_frame
+        mask = valid
+        pixels = np.stack([u[mask], v[mask]], axis=-1)
+        return pixels, mask
+
+    def project_trajectory(self, trajectory: RenderableTrajectory) -> np.ndarray:
+        """Project an entire trajectory to pixel space; returns (M,2) pixels."""
+        if trajectory.is_empty():
+            return np.empty((0, 2))
+        pixels, _ = self.project_points(trajectory.poses.vec3[:, :3])
+        return pixels
+
+    def project_trajectories(
+        self, trajectories: Iterable[RenderableTrajectory]
+    ) -> list[np.ndarray]:
+        """Project multiple trajectories."""
+        return [self.project_trajectory(traj) for traj in trajectories]
+
+
+@dataclasses.dataclass
 class Camera:
     """Captures camera images for all timesteps.
 
@@ -971,12 +1322,22 @@ class Cameras:
     """Captures cameras for all timesteps."""
 
     camera_by_logical_id: dict[str, Camera] = dataclasses.field(default_factory=dict)
+    calibrations_by_logical_id: dict[str, CameraCalibration] = dataclasses.field(
+        default_factory=dict
+    )
 
     def add_camera_image(self, camera_image: RolloutCameraImage.CameraImage) -> None:
         camera = self.camera_by_logical_id.setdefault(
             camera_image.logical_id, Camera.create_empty(camera_image.logical_id)
         )
         camera.add_image(camera_image)
+
+    def add_calibration(
+        self, available_camera: AvailableCamerasReturn.AvailableCamera
+    ) -> None:
+        """Store calibration for a camera logical id."""
+        calibration = CameraCalibration.from_available_camera(available_camera)
+        self.calibrations_by_logical_id[calibration.logical_id] = calibration
 
 
 @dataclasses.dataclass
@@ -997,6 +1358,12 @@ class Routes:
         default_factory=lambda: []
     )
     artists: dict[str, list[plt.Artist]] | None = None
+    camera_artists_by_ax: dict[int, plt.Artist | None] = dataclasses.field(
+        default_factory=dict
+    )
+    # Set after convert_routes_to_global_frame is called; used for camera projection.
+    _ego_trajectory: Optional["RenderableTrajectory"] = None
+    _ego_coords_rig_to_aabb_center: Optional[QVec] = None
 
     def add_route(self, route: Route) -> None:
         """Add a route to the routes.
@@ -1021,13 +1388,17 @@ class Routes:
 
     def convert_routes_to_global_frame(
         self,
-        ego_trajectory: RenderableTrajectory,
+        ego_trajectory: "RenderableTrajectory",
         ego_coords_rig_to_aabb_center: QVec,
     ) -> None:
         """Convert the routes to the global frame and store them.
 
-        Used during ASL parsing.
+        Used during ASL parsing. Also stores references needed for camera projection.
         """
+        # Store references for camera projection
+        self._ego_trajectory = ego_trajectory
+        self._ego_coords_rig_to_aabb_center = ego_coords_rig_to_aabb_center
+
         for timestamp_us, route_in_rig_frame in zip(
             self.timestamps_us, self.routes_in_rig_frame, strict=True
         ):
@@ -1053,12 +1424,93 @@ class Routes:
             return None
         return self.routes_in_global_frame[idx]
 
+    def get_route_at_time_in_rig_frame(self, time: int) -> np.ndarray | None:
+        """Get the route in rig frame at a given time.
+
+        Used for camera projection where rig frame coordinates are needed.
+        """
+        idx = np.searchsorted(self.timestamps_us, time)
+        if idx >= len(self.routes_in_rig_frame):
+            return None
+        return self.routes_in_rig_frame[idx]
+
     def remove_artists(self) -> None:
         """Remove the artists for the routes."""
         if self.artists is not None:
-            for artist in self.artists["route"]:
-                artist.remove()
+            for artist_list in self.artists.values():
+                for artist in artist_list:
+                    artist.remove()
             self.artists = None
+
+    def render_on_camera(
+        self,
+        ax: plt.Axes,
+        projector: "CameraProjector",
+        time: int,
+    ) -> list[plt.Artist]:
+        """Render route waypoints onto a camera axis.
+
+        Transforms the route from global frame to current rig frame, projects
+        to pixel coordinates, and draws it as a line on the given axis.
+        Caches the artist for efficient updates.
+        """
+        artist = self.camera_artists_by_ax.get(id(ax))
+        overlay_artists: list[plt.Artist] = []
+
+        def _clear_artist() -> list[plt.Artist]:
+            if artist is not None:
+                artist.set_data([], [])
+                artist.set_alpha(0.0)
+                overlay_artists.append(artist)
+            return overlay_artists
+
+        # Get route in global frame
+        route_global = self.get_route_at_time(time, strict=False)
+        if route_global is None or len(route_global) < 2:
+            return _clear_artist()
+
+        # Need ego trajectory and AABB offset to transform to rig frame
+        if self._ego_trajectory is None or self._ego_coords_rig_to_aabb_center is None:
+            return _clear_artist()
+
+        # Transform from global frame to current rig frame:
+        # 1. Get current ego pose (local->AABB)
+        # 2. Convert to local->rig
+        # 3. Apply inverse to get global points in rig frame
+        ego_pose_local_aabb = self._ego_trajectory.interpolate_pose(time)
+        ego_pose_local_rig = (
+            ego_pose_local_aabb @ self._ego_coords_rig_to_aabb_center.inverse()
+        )
+
+        # Transform route points from global to rig frame
+        route_qvec_global = QVec(
+            vec3=route_global[:, :3],
+            quat=np.array([[0, 0, 0, 1]] * len(route_global)),
+        )
+        route_qvec_rig = ego_pose_local_rig.inverse() @ route_qvec_global
+        route_rig = route_qvec_rig.vec3
+
+        pixels, _ = projector.project_points(route_rig)
+
+        if pixels.shape[0] < 2:
+            return _clear_artist()
+
+        if artist is None:
+            artist = ax.plot(
+                pixels[:, 0],
+                pixels[:, 1],
+                "-",
+                color="lime",
+                linewidth=2.0,
+                alpha=0.8,
+            )[0]
+            self.camera_artists_by_ax[id(ax)] = artist
+        else:
+            artist.set_data(pixels[:, 0], pixels[:, 1])
+            artist.set_alpha(0.8)
+
+        overlay_artists.append(artist)
+        return overlay_artists
 
     def render_at_time(
         self,
@@ -1068,14 +1520,45 @@ class Routes:
         """Render the route at a given time.
 
         Can be called repeatedly to update the route to current time.
+        Includes a connecting line from the ego position to the first waypoint.
         """
         route = self.get_route_at_time(time, strict=False)
         if route is None:
             return {}
+
+        # Get ego position for connecting line to first waypoint
+        ego_pos: np.ndarray | None = None
+        if self._ego_trajectory is not None and len(route) > 0:
+            try:
+                ego_pose = self._ego_trajectory.interpolate_pose(time)
+                ego_pos = ego_pose.vec3
+            except ValueError:
+                pass  # Time outside trajectory range
+
         if self.artists is not None:
             self.artists["route"][0].set_data(route[:, 0], route[:, 1])
+            # Update connecting line
+            if ego_pos is not None:
+                self.artists["route_to_first_wp"][0].set_data(
+                    [ego_pos[0], route[0, 0]], [ego_pos[1], route[0, 1]]
+                )
+            else:
+                self.artists["route_to_first_wp"][0].set_data([], [])
             return self.artists
-        current_artists = {"route": ax.plot(route[:, 0], route[:, 1], "g-")}
+
+        current_artists: dict[str, list[plt.Artist]] = {
+            "route": ax.plot(route[:, 0], route[:, 1], "g-")
+        }
+        # Add connecting line from ego to first waypoint
+        if ego_pos is not None:
+            current_artists["route_to_first_wp"] = ax.plot(
+                [ego_pos[0], route[0, 0]],
+                [ego_pos[1], route[0, 1]],
+                "g--",
+                alpha=0.6,
+            )
+        else:
+            current_artists["route_to_first_wp"] = ax.plot([], [], "g--", alpha=0.6)
         self.artists = current_artists
         return current_artists
 

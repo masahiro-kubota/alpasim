@@ -9,6 +9,7 @@ import logging
 from typing import Any, List, Optional, Type, TypeAlias
 
 import numpy as np
+from alpasim_grpc.v0.common_pb2 import DynamicState
 from alpasim_grpc.v0.egodriver_pb2 import (
     DriveRequest,
     DriveResponse,
@@ -27,8 +28,8 @@ from alpasim_runtime.services.service_base import (
     WILDCARD_SCENE_ID,
     ServiceBase,
     SessionInfo,
-    timed_method,
 )
+from alpasim_runtime.telemetry.rpc_wrapper import profiled_rpc_call
 from alpasim_runtime.types import ImageWithMetadata
 from alpasim_utils.polyline import Polyline
 from alpasim_utils.trajectory import Trajectory
@@ -71,7 +72,6 @@ class DriverService(ServiceBase[EgodriverServiceStub]):
             scene_id=scene_id,
         )
 
-    @timed_method("initialize_session")
     async def _initialize_session(
         self, session_info: SessionInfo, **kwargs: Any
     ) -> None:
@@ -104,22 +104,24 @@ class DriverService(ServiceBase[EgodriverServiceStub]):
         if self.skip:
             return
 
-        await self.stub.start_session(request)
+        await profiled_rpc_call(
+            "start_session", "driver", self.stub.start_session, request
+        )
 
-    @timed_method("cleanup_session")
     async def _cleanup_session(self, **kwargs: Any) -> None:
         """Clean up driver session."""
         if self.skip:
             return
 
         close_request = DriveSessionCloseRequest(session_uuid=self.session_info.uuid)
-        await self.stub.close_session(close_request)
+        await profiled_rpc_call(
+            "close_session", "driver", self.stub.close_session, close_request
+        )
 
     async def get_available_scenes(self) -> List[str]:
         """Get list of available scenes from the driver service."""
         return [WILDCARD_SCENE_ID]
 
-    @timed_method("submit_image")
     async def submit_image(self, image: ImageWithMetadata) -> None:
         """Submit an image observation for the current session."""
         request = RolloutCameraImage(
@@ -139,14 +141,28 @@ class DriverService(ServiceBase[EgodriverServiceStub]):
         if self.skip:
             return
 
-        await self.stub.submit_image_observation(request)
+        await profiled_rpc_call(
+            "submit_image_observation",
+            "driver",
+            self.stub.submit_image_observation,
+            request,
+        )
 
-    @timed_method("submit_trajectory")
-    async def submit_trajectory(self, trajectory: Trajectory) -> None:
-        """Submit an egomotion trajectory for the current session."""
+    async def submit_trajectory(
+        self,
+        trajectory: Trajectory,
+        dynamic_state: DynamicState,
+    ) -> None:
+        """Submit an egomotion trajectory for the current session.
+
+        Args:
+            trajectory: The estimated ego trajectory.
+            dynamic_state: The estimated dynamic state (velocities, accelerations) in rig frame.
+        """
         request = RolloutEgoTrajectory(
             session_uuid=self.session_info.uuid,
             trajectory=trajectory.to_grpc(),
+            dynamic_state=dynamic_state,
         )
 
         await self.session_info.log_writer.log_message(
@@ -156,9 +172,13 @@ class DriverService(ServiceBase[EgodriverServiceStub]):
         if self.skip:
             return
 
-        await self.stub.submit_egomotion_observation(request)
+        await profiled_rpc_call(
+            "submit_egomotion_observation",
+            "driver",
+            self.stub.submit_egomotion_observation,
+            request,
+        )
 
-    @timed_method("submit_route")
     async def submit_route(
         self, timestamp_us: int, route_polyline_in_rig: Polyline
     ) -> None:
@@ -176,9 +196,10 @@ class DriverService(ServiceBase[EgodriverServiceStub]):
         if self.skip:
             return
 
-        await self.stub.submit_route(request)
+        await profiled_rpc_call(
+            "submit_route", "driver", self.stub.submit_route, request
+        )
 
-    @timed_method("submit_recording_ground_truth")
     async def submit_recording_ground_truth(
         self, timestamp_us: int, trajectory: Trajectory
     ) -> None:
@@ -198,9 +219,13 @@ class DriverService(ServiceBase[EgodriverServiceStub]):
         if self.skip:
             return
 
-        await self.stub.submit_recording_ground_truth(request)
+        await profiled_rpc_call(
+            "submit_recording_ground_truth",
+            "driver",
+            self.stub.submit_recording_ground_truth,
+            request,
+        )
 
-    @timed_method("drive")
     async def drive(
         self, time_now_us: int, time_query_us: int, renderer_data: Optional[bytes]
     ) -> Trajectory:
@@ -241,7 +266,9 @@ class DriverService(ServiceBase[EgodriverServiceStub]):
                 trajectory=trajectory.to_grpc(),
             )
         else:
-            response = await self.stub.drive(request)
+            response = await profiled_rpc_call(
+                "drive", "driver", self.stub.drive, request
+            )
 
         await self.session_info.log_writer.log_message(LogEntry(driver_return=response))
 

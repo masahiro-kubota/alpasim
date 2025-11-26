@@ -40,7 +40,7 @@ from alpasim_runtime.replay_services import (
     TrafficReplayService,
 )
 from alpasim_runtime.replay_services.asl_reader import ASLReader
-from alpasim_runtime.simulate.__main__ import aio_main
+from alpasim_runtime.simulate.__main__ import run_simulation
 from rich import print
 
 import grpc
@@ -141,14 +141,12 @@ async def asl_reader(test_data_dir: Path) -> Optional[ASLReader]:
 def runtime_configs(test_data_dir: Path, tmp_path: Path) -> Dict[str, str]:
     """Create runtime configuration files for testing.
 
-    The save_dir is overridden to use pytest's tmp_path to ensure test outputs are
+    Uses pytest's tmp_path as log_dir to ensure test outputs are
     automatically cleaned up after test execution.
     """
     user_config_path = test_data_dir / REQUIRED_TEST_FILES["user_config"]
     user_config = yaml.safe_load(user_config_path.read_text(encoding="utf-8"))
 
-    # Override save_dir to use temp directory for test outputs
-    user_config["save_dir"] = str(tmp_path / "asl-output")
     test_user_config = tmp_path / "test-user-config.yaml"
     test_user_config.write_text(yaml.dump(user_config), encoding="utf-8")
 
@@ -164,6 +162,10 @@ def runtime_configs(test_data_dir: Path, tmp_path: Path) -> Dict[str, str]:
     test_network_config = tmp_path / "test-network-config.yaml"
     test_network_config.write_text(yaml.dump(network_config), encoding="utf-8")
 
+    # log_dir is where all outputs go (asl/, metrics/, txt-logs/)
+    log_dir = tmp_path / "output"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
     print("network_config:")
     print(yaml.dump(network_config, default_flow_style=False, indent=2))
     print("user_config:")
@@ -173,6 +175,7 @@ def runtime_configs(test_data_dir: Path, tmp_path: Path) -> Dict[str, str]:
         "user_config": str(test_user_config),
         "network_config": str(test_network_config),
         "usdz_glob": str(test_data_dir / "*.usdz"),
+        "log_dir": str(log_dir),
     }
 
 
@@ -215,13 +218,13 @@ def all_services(
 
 @patch("concurrent.futures.ProcessPoolExecutor")
 @pytest.mark.manual
-async def test_aio_main_full_simulation(
+async def test_run_simulation_full(
     mock_executor_class: MagicMock,
     runtime_configs: Dict[str, str],
     asl_reader: Any,
     all_services: None,  # Needed to start the services
 ) -> None:
-    """Test the complete aio_main flow with multiple servers."""
+    """Test the complete run_simulation flow with multiple servers."""
     # Mock the process pool to run in-thread for testing
     mock_executor = MagicMock()
     mock_executor_class.return_value.__enter__.return_value = mock_executor
@@ -243,11 +246,11 @@ async def test_aio_main_full_simulation(
         user_config=runtime_configs["user_config"],
         network_config=runtime_configs["network_config"],
         usdz_glob=runtime_configs["usdz_glob"],
-        prometheus_out=None,
+        log_dir=runtime_configs["log_dir"],
     )
 
     # Run the full simulation
-    success = await aio_main(args)
+    success = await run_simulation(args)
 
     # Verify success
     assert success is True

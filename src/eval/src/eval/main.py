@@ -6,7 +6,6 @@ import asyncio
 import dataclasses
 import glob
 import logging
-import multiprocessing
 import multiprocessing as mp
 import os
 import pathlib
@@ -43,8 +42,6 @@ from eval.scorers import create_scorer_group
 from eval.video import render_and_save_video_for_eval_container
 
 logger = logging.getLogger("alpasim_eval")
-logger.setLevel(logging.INFO)
-logger.addHandler(logging.StreamHandler())
 
 TRACKER_FILE_NAME = "_complete"
 
@@ -84,8 +81,8 @@ async def load_simulation_results(
 
     # Start new loop for remaining messages
     driver_responses: DriverResponses = DriverResponses(
-        ego_raabb=actor_trajectories["EGO"].raabb,
         ego_coords_rig_to_aabb_center=ego_coords_rig_to_aabb_center,
+        ego_trajectory_local=actor_trajectories["EGO"],
     )
 
     async for message in async_read_pb_log(eval_result_container.file_path):
@@ -114,6 +111,9 @@ async def load_simulation_results(
             driver_estimated_trajectory = driver_estimated_trajectory.append(
                 Trajectory.from_grpc(message.driver_ego_trajectory.trajectory),
             )
+        elif message.WhichOneof("log_entry") == "available_cameras_return":
+            for available_camera in message.available_cameras_return.available_cameras:
+                cameras.add_calibration(available_camera)
 
     driver_estimated_trajectory = RenderableTrajectory.from_trajectory(
         driver_estimated_trajectory,
@@ -184,8 +184,6 @@ def process_evaluation_result_container(
     artifacts: dict[str, Artifact],
     run_metadata: dict[str, Any],
 ) -> pl.DataFrame:
-    pass
-
     scorers = create_scorer_group(cfg)
     evaluation_result_container = asyncio.run(
         load_simulation_results(eval_result_container, cfg, artifacts)
@@ -228,8 +226,20 @@ def main() -> int:
     parser.add_argument("--config_path", type=str)
     parser.add_argument("--trajdata_cache_dir", type=str)
     parser.add_argument("--usdz_glob", type=str)
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        help="Logging level (DEBUG, INFO, WARNING, ERROR)",
+    )
 
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s",
+        datefmt="%H:%M:%S",
+    )
 
     assert args.config_path.endswith(".yaml")
 
@@ -276,7 +286,7 @@ def main() -> int:
     ]
 
     num_workers = min(
-        multiprocessing.cpu_count(),
+        mp.cpu_count(),
         cfg.num_processes,
         len(evaluation_result_containers),
     )
@@ -284,7 +294,7 @@ def main() -> int:
     logger.info(
         "Using %d workers: %d CPUs available, config asks for %d",
         num_workers,
-        multiprocessing.cpu_count(),
+        mp.cpu_count(),
         cfg.num_processes,
     )
 
@@ -304,7 +314,7 @@ def main() -> int:
 
     if num_workers > 1:
         logger.info("Processing evaluation result containers in multi-process mode.")
-        with multiprocessing.Pool(
+        with mp.Pool(
             processes=num_workers,
         ) as pool:
             # Use imap_unordered for potentially better performance if render times vary

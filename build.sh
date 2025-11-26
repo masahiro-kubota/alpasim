@@ -31,8 +31,9 @@ docker build \
   --secret id=netrc,src=$HOME/.netrc \
   -t $DOCKER_IMAGE_TAG .
 
-# enroot import -o $IMAGE_NAME.sqsh dockerd://$DOCKER_IMAGE_TAG
+rm -f $IMAGE_NAME.sqsh
+enroot import -o $IMAGE_NAME.sqsh dockerd://$DOCKER_IMAGE_TAG
 
-# rsync -avz --progress --no-compress "$IMAGE_NAME.sqsh" "ord-dc:/lustre/fs12/portfolios/av/projects/av_alpamayo_sim/.cache/sqsh/${IMAGE_NAME}.sqsh"
+rsync -avz --progress "$IMAGE_NAME.sqsh" "nvpark:/lustre/fs12/portfolios/av/projects/av_alpamayo_sim/.cache/sqsh/dev/${IMAGE_NAME}.sqsh"
 
 # docker push $DOCKER_IMAGE_TAG

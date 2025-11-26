@@ -122,18 +122,22 @@ class CameraIntrinsicsConfig:
 
 @dataclass
 class CameraDefinitionConfig:
-    # For NRE sensorsim, overwrite the logical_id of one of the existing
-    # cameras: [
-    #     'camera_cross_left_120fov',
-    #     'camera_cross_right_120fov',
-    #     'camera_front_tele_30fov',
-    #     'camera_front_wide_120fov'
-    # ]
+    """Configuration for overriding camera definitions from sensorsim.
+
+    Only `logical_id` is required - it identifies which camera to override.
+    Other fields are optional; if not provided, the values from sensorsim
+    are preserved.
+    """
+
     logical_id: str
-    rig_to_camera: PoseConfig
-    intrinsics: CameraIntrinsicsConfig
-    resolution_hw: tuple[int, int]
-    # TODO(migl): Not sure to what extent this field is used.
+    # For NRE sensorsim, logical_id must match one of the existing cameras:
+    #     - 'camera_cross_left_120fov'
+    #     - 'camera_cross_right_120fov'
+    #     - 'camera_front_tele_30fov'
+    #     - 'camera_front_wide_120fov'
+    rig_to_camera: Optional[PoseConfig] = None
+    intrinsics: Optional[CameraIntrinsicsConfig] = None
+    resolution_hw: Optional[tuple[int, int]] = None
     # ShutterType is one of: [
     #     "ROLLING_TOP_TO_BOTTOM",
     #     "ROLLING_LEFT_TO_RIGHT",
@@ -141,7 +145,7 @@ class CameraDefinitionConfig:
     #     "ROLLING_RIGHT_TO_LEFT",
     #     "GLOBAL"
     # ]
-    shutter_type: str
+    shutter_type: Optional[str] = None
 
 
 class PhysicsUpdateMode(Enum):
@@ -242,25 +246,20 @@ class UserEndpointConfig:
 
 
 @dataclass
-class RoadCastConfig:
-    """Configuration for RoadCast output"""
-
-    # Radial distance from the ego to find lanes to write to RoadCast.
-    lane_radius: float = 50.0
-
-
-@dataclass
 class UserSimulatorConfig:
     """The section of simulator config created manually by the user"""
 
     scenarios: list[ScenarioConfig] = MISSING
-    save_dir: str = MISSING
     enable_autoresume: bool = False
     endpoints: UserEndpointConfig = MISSING
 
-    roadcast: RoadCastConfig = field(default_factory=lambda: RoadCastConfig())
     smooth_trajectories: bool = True  # whether to smooth trajectories with cubic spline
     extra_cameras: list[CameraDefinitionConfig] = field(default_factory=list)
+
+    # Number of worker processes for parallel rollout execution.
+    # 1 = inline mode, all in one process, good for debugging
+    # >1 = multi-worker mode with subprocess-based parallelism
+    nr_workers: int = MISSING
 
 
 @dataclass

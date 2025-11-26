@@ -89,6 +89,9 @@ class WizardConfig:
     run_name: Optional[str] = None
     run_method: RunMethod = MISSING
     run_mode: RunMode = MISSING
+
+    # Global log level for all alpasim services (DEBUG, INFO, WARNING, ERROR)
+    log_level: str = "INFO"
     description: Optional[str] = None  # TODO(mwatson): is this redundant to run_name?
     submitter: Optional[str] = None
 
