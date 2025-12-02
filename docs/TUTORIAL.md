@@ -244,8 +244,8 @@ the context of a full simulation.
 2. (Terminal 1) `cd` to the generated directory (`tutorial_dbg`) and note the command/port of the
 component to be replaced in `docker-compose.yaml`. For the simulation case, we are looking for
 components in the `sim` profile, which includes `controller-0`, `driver-0`, `physics-0`,
-`runtime-0`, and `sensorsim-0`. Here we will replace `controller-0`, which has been allocated port
-6003.
+`runtime-0`, and `sensorsim-0`. Here we will replace `controller-0`, which in this case has been
+allocated port 6003.
 3. (Terminal 2) `cd` into the the controller src directory (`<repo_root>/src/controller/`)
 and prepare to start the controller. Note that there are various ways to accomplish this, including
 through an IDE. Add breakpoints as desired in the controller code and then start the controller
