@@ -17,7 +17,7 @@ services:
 
   sensorsim:
     replicas_per_container: 1
-    gpus: [1]
+    gpus: [0]
 
   physics:
     replicas_per_container: 1

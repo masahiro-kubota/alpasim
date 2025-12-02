@@ -17,7 +17,6 @@ Suitable use cases include:
 - **Safety Analysis**: Evaluate vehicle behavior in edge cases and challenging scenarios
 - **Performance Benchmarking/Regression Testing**: Compare different models and configurations
 - **Debugging**: Understand and debug complex autonomous driving behaviors
-<!-- TODO: Should we add notes on RL/data generation? -->
 
 
 ### **Sensor Fidelity**
@@ -105,11 +104,11 @@ Contributors in each topic in alphabetical order
 
 **Architecture Design & Networking:** Michal Tyszkiewicz
 
-**Open Sourcing:** Guillermo Garcia Cobo, Maximilian Igl, Peter Karkus, Michael Watson
+**Open Sourcing:** Guillermo Garcia Cobo, Maximilian Igl, Peter Karkus, Ellie Tanimura, Michael Watson
 
 **Infrastructure & Wizard:** Maximilian Igl, Aaron Smith, Michal Tyszkiewicz, Michael Watson, Qi Wu (SLURM deployment), Le Zhang (Data management)
 
-**Runtime:** Maximilian Igl, Aaron Smith, Michal Tyszkiewicz, Michael Watson
+**Runtime:** Maximilian Igl, Aaron Smith, Ellie Tanimura, Michal Tyszkiewicz, Michael Watson
 
 **CICD:** Maximilian Igl, Aaron Smith
 
