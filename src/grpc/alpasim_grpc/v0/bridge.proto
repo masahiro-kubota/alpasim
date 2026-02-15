@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2025 NVIDIA Corporation
+
+syntax = "proto3";
+
+package bridge;
+
+import "alpasim_grpc/v0/common.proto";
+
+service ROS2BridgeService {
+    // Session management
+    rpc start_session (BridgeSessionRequest) returns (common.SessionRequestStatus);
+    rpc close_session (BridgeSessionCloseRequest) returns (common.Empty);
+
+    // Publish one step of data to ROS2, wait for planner trajectory, return it.
+    rpc step (BridgeStepRequest) returns (BridgeStepResponse);
+
+    rpc get_version (common.Empty) returns (common.VersionId);
+    rpc shut_down (common.Empty) returns (common.Empty);
+}
+
+message BridgeSessionRequest {
+    string session_uuid = 1;
+    repeated string camera_names = 2;
+}
+
+message BridgeSessionCloseRequest {
+    string session_uuid = 1;
+}
+
+message CameraImage {
+    string camera_id = 1;
+    bytes image_bytes = 2;
+    uint32 width = 3;
+    uint32 height = 4;
+}
+
+message TrafficObject {
+    string object_id = 1;
+    common.Pose pose = 2;
+    common.AABB aabb = 3;
+    bool is_static = 4;
+}
+
+message BridgeStepRequest {
+    string session_uuid = 1;
+    fixed64 timestamp_us = 2;
+
+    // Ego vehicle
+    common.Pose ego_pose = 3;
+    common.DynamicState ego_dynamic_state = 4;
+
+    // Camera images
+    repeated CameraImage camera_images = 5;
+
+    // Traffic objects (1-step delayed from traffic.simulate())
+    repeated TrafficObject traffic_objects = 6;
+
+    // drive() parameters
+    fixed64 time_now_us = 7;
+    fixed64 time_query_us = 8;
+
+    // When true (force_gt period), bridge returns immediately without waiting for planner.
+    bool force_gt = 9;
+}
+
+message BridgeStepResponse {
+    // Planner trajectory. Empty when force_gt or not yet received.
+    common.Trajectory trajectory = 1;
+    bool has_trajectory = 2;
+}
